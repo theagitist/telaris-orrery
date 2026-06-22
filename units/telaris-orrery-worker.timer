@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the Telaris Orrery provisioning worker periodically
+
+[Timer]
+# First run shortly after boot, then once a minute while idle. The worker
+# claims FOR UPDATE SKIP LOCKED, so an overrun pass never collides with the
+# next tick.
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

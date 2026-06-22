@@ -81,6 +81,24 @@ define('NGINX', '/usr/sbin/nginx');
 define('CURL', '/usr/bin/curl');
 define('TAR', '/usr/bin/tar');
 
+// --- worker (the `work` subcommand drains the Pluriverse provisioning_jobs) ---
+// Connects to the Pluriverse DB as the telaris_pluriverse role (the Orrery user
+// can read its password keyfile; www-data and the Orrery user share only the
+// job table). Defaults mirror the Pluriverse config.php; override via env.
+define('PLURIVERSE_DB_HOST', cfg('TELARIS_PLURIVERSE_DB_HOST', 'private-polivoxia-pg1-do-user-18640906-0.i.db.ondigitalocean.com'));
+define('PLURIVERSE_DB_PORT', cfg('TELARIS_PLURIVERSE_DB_PORT', '25060'));
+define('PLURIVERSE_DB_NAME', cfg('TELARIS_PLURIVERSE_DB_NAME', 'telaris_pluriverse'));
+define('PLURIVERSE_DB_USER', cfg('TELARIS_PLURIVERSE_DB_USER', 'telaris_pluriverse'));
+define('PLURIVERSE_DB_PASS_FILE', cfg('TELARIS_PLURIVERSE_DB_PASS_FILE', getenv('HOME') . '/apps/keys/pluriverse-postgres-dev'));
+// Operator-identity handoff key, shared between the Pluriverse web app (seals at
+// approve time, runs as www-data) and this worker (unseals, runs as the Orrery
+// user). A narrow capability: it decrypts only the per-job operator handoff
+// blob, never the Pluriverse PII master key (which stays www-data-only). The
+// job payload therefore carries no plaintext PII at rest.
+define('HANDOFF_KEY_FILE', cfg('TELARIS_ORRERY_HANDOFF_KEY', '/etc/telaris-orrery/handoff.key'));
+define('WORKER_MAX_JOBS',     (int)cfg('TELARIS_ORRERY_WORKER_MAX_JOBS', '10'));
+define('WORKER_MAX_ATTEMPTS', (int)cfg('TELARIS_ORRERY_WORKER_MAX_ATTEMPTS', '5'));
+
 // Reserved labels that must never be provisioned (collide with real hosts /
 // special names). Extend as the Orrery grows.
 const RESERVED_LABELS = [
@@ -94,11 +112,15 @@ const RESERVED_LABELS = [
 // Small utilities
 // ===========================================================================
 
+/** A controlled, expected failure. The top-level dispatch prints it + exits 1;
+ *  the `work` loop catches it per-job so one bad job never kills the worker. */
+class OrreryError extends RuntimeException {}
+
 function out(string $s): void { fwrite(STDOUT, $s . "\n"); }
 function info(string $s): void { fwrite(STDOUT, "  " . $s . "\n"); }
 function step(string $s): void { fwrite(STDOUT, "[*] " . $s . "\n"); }
 function warn(string $s): void { fwrite(STDERR, "[!] " . $s . "\n"); }
-function fail(string $s): never { fwrite(STDERR, "[x] " . $s . "\n"); exit(1); }
+function fail(string $s): never { throw new OrreryError($s); }
 
 /** Session env so rootless `podman` / `systemctl --user` reach the user manager. */
 function user_env(): array {
@@ -819,6 +841,270 @@ function cmd_resume(string $label): void {
     out("Resumed '$label'.");
 }
 
+// ===========================================================================
+// worker: drain the Pluriverse provisioning_jobs queue
+// ===========================================================================
+//
+// The Pluriverse web app (www-data) only ever INSERTs a typed job row. This
+// worker (the Orrery user) claims jobs FOR UPDATE SKIP LOCKED, re-validates
+// every field, and runs the fixed provisioner sequence. No job field is ever
+// shell-interpolated: cmd_provision() is called in-process with an option
+// array, and all SQL is parameterized. See the trust-boundary section of the
+// Self-service instances plan.
+
+/** PDO to the Pluriverse DB as the telaris_pluriverse role (verify-ca). */
+function pluriverse_pdo(): PDO {
+    if (!is_readable(PLURIVERSE_DB_PASS_FILE)) {
+        fail('Pluriverse DB password keyfile not readable: ' . PLURIVERSE_DB_PASS_FILE);
+    }
+    $pass = trim((string)file_get_contents(PLURIVERSE_DB_PASS_FILE));
+    $sslmode = is_readable(DB_SSL_CA) ? 'verify-ca' : 'require';
+    $dsn = 'pgsql:host=' . PLURIVERSE_DB_HOST . ';port=' . PLURIVERSE_DB_PORT
+        . ';dbname=' . PLURIVERSE_DB_NAME . ';sslmode=' . $sslmode;
+    if (is_readable(DB_SSL_CA)) {
+        $dsn .= ';sslrootcert=' . DB_SSL_CA;
+    }
+    return new PDO($dsn, PLURIVERSE_DB_USER, $pass, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_TIMEOUT => 15,
+    ]);
+}
+
+/** Load the 32-byte operator-handoff key (shared with the Pluriverse app). */
+function handoff_key(): string {
+    if (!is_readable(HANDOFF_KEY_FILE)) {
+        fail('Operator-handoff key not readable: ' . HANDOFF_KEY_FILE
+            . ' (run the host bootstrap to create it, shared theagitist:www-data 0640).');
+    }
+    $raw = (string)file_get_contents(HANDOFF_KEY_FILE);
+    // Accept either 32 raw bytes or 64 hex chars (whitespace-trimmed).
+    $t = trim($raw);
+    if (strlen($t) === 64 && preg_match('/^[0-9a-f]+$/i', $t)) {
+        $raw = (string)hex2bin($t);
+    }
+    if (strlen($raw) !== SODIUM_CRYPTO_SECRETBOX_KEYBYTES) {
+        fail('Operator-handoff key must be ' . SODIUM_CRYPTO_SECRETBOX_KEYBYTES . ' bytes (or 64 hex).');
+    }
+    return $raw;
+}
+
+/** Seal {email,first,last} for a job payload. Format: hex(nonce(24)||cipher). */
+function handoff_seal(array $data): string {
+    $key = handoff_key();
+    $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+    $plain = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+    $cipher = sodium_crypto_secretbox($plain, $nonce, $key);
+    sodium_memzero($key);
+    return bin2hex($nonce . $cipher);
+}
+
+/** Reverse handoff_seal: returns the decoded array, or throws on tamper. */
+function handoff_unseal(string $hex): array {
+    if ($hex === '' || !preg_match('/^[0-9a-f]+$/i', $hex)) {
+        throw new OrreryError('handoff blob is not hex');
+    }
+    $bytes = (string)hex2bin($hex);
+    $nlen = SODIUM_CRYPTO_SECRETBOX_NONCEBYTES;
+    if (strlen($bytes) < $nlen + SODIUM_CRYPTO_SECRETBOX_MACBYTES) {
+        throw new OrreryError('handoff blob too short');
+    }
+    $key = handoff_key();
+    $plain = sodium_crypto_secretbox_open(substr($bytes, $nlen), substr($bytes, 0, $nlen), $key);
+    sodium_memzero($key);
+    if ($plain === false) {
+        throw new OrreryError('handoff blob auth-tag mismatch (wrong key / tampered)');
+    }
+    $data = json_decode($plain, true);
+    if (!is_array($data)) {
+        throw new OrreryError('handoff blob is not a JSON object');
+    }
+    return $data;
+}
+
+/**
+ * Atomically claim the next due job. Returns the claimed row (status already
+ * flipped to 'running', attempt_count incremented) or null if the queue is
+ * empty. Uses FOR UPDATE SKIP LOCKED so concurrent workers never collide.
+ */
+function worker_claim_job(PDO $pdo): ?array {
+    $pdo->beginTransaction();
+    try {
+        $sel = $pdo->query("
+            SELECT id, request_id, job_type, label, payload::text AS payload, attempt_count
+            FROM provisioning_jobs
+            WHERE status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+            ORDER BY id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        ");
+        $row = $sel->fetch(PDO::FETCH_ASSOC);
+        if ($row === false) {
+            $pdo->rollBack();
+            return null;
+        }
+        $upd = $pdo->prepare("
+            UPDATE provisioning_jobs
+            SET status = 'running', attempt_count = attempt_count + 1, last_attempt_at = NOW()
+            WHERE id = :id
+        ");
+        $upd->execute([':id' => (int)$row['id']]);
+        $pdo->commit();
+        $row['attempt_count'] = (int)$row['attempt_count'] + 1;
+        return $row;
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $e;
+    }
+}
+
+/** Mark a claimed job done (terminal success). */
+function worker_finish_job(PDO $pdo, int $jobId, array $result): void {
+    $stmt = $pdo->prepare("
+        UPDATE provisioning_jobs
+        SET status = 'done', last_error = NULL, result = CAST(:r AS JSONB)
+        WHERE id = :id
+    ");
+    $stmt->bindValue(':r', json_encode($result, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $stmt->bindValue(':id', $jobId, PDO::PARAM_INT);
+    $stmt->execute();
+}
+
+/**
+ * Record a failed attempt: re-queue with backoff if attempts remain, else
+ * give up. Backoff = attempt^2 minutes (1, 4, 9, 16, ...).
+ */
+function worker_fail_job(PDO $pdo, int $jobId, int $attemptCount, string $error): string {
+    $error = substr($error, 0, 2048);
+    if ($attemptCount >= WORKER_MAX_ATTEMPTS) {
+        $stmt = $pdo->prepare("
+            UPDATE provisioning_jobs SET status = 'given_up', last_error = :e WHERE id = :id
+        ");
+        $stmt->execute([':e' => $error, ':id' => $jobId]);
+        return 'given_up';
+    }
+    $delayMin = $attemptCount * $attemptCount;
+    $stmt = $pdo->prepare("
+        UPDATE provisioning_jobs
+        SET status = 'queued', last_error = :e, next_attempt_at = NOW() + (:d * INTERVAL '1 minute')
+        WHERE id = :id
+    ");
+    $stmt->bindValue(':e', $error);
+    $stmt->bindValue(':d', $delayMin, PDO::PARAM_INT);
+    $stmt->bindValue(':id', $jobId, PDO::PARAM_INT);
+    $stmt->execute();
+    return 'requeued';
+}
+
+/** Set instance_requests.status (+ optional instance_id) for a job's request. */
+function worker_set_request_status(PDO $pdo, ?int $requestId, string $status, ?int $instanceId = null): void {
+    if ($requestId === null) return;
+    $sets = ['status = :s'];
+    $params = [':s' => $status, ':id' => $requestId];
+    if ($instanceId !== null) {
+        $sets[] = 'instance_id = :iid';
+        $params[':iid'] = $instanceId;
+    }
+    $stmt = $pdo->prepare('UPDATE instance_requests SET ' . implode(', ', $sets) . ' WHERE id = :id');
+    $stmt->execute($params);
+}
+
+/** Run one claimed job to completion. Throws on failure (caller records it). */
+function worker_run_job(PDO $pdo, array $job): array {
+    $jobType = (string)$job['job_type'];
+    $label = validate_label((string)$job['label']); // re-validate charset / reserved
+    $requestId = $job['request_id'] !== null ? (int)$job['request_id'] : null;
+    $payload = [];
+    if ($job['payload'] !== null && $job['payload'] !== '') {
+        $payload = json_decode((string)$job['payload'], true);
+        if (!is_array($payload)) { throw new OrreryError('job payload is not a JSON object'); }
+    }
+
+    switch ($jobType) {
+        case 'provision':
+            // Unseal the operator identity (never plaintext at rest in the queue).
+            $sealed = (string)($payload['operator_sealed'] ?? '');
+            if ($sealed === '') { throw new OrreryError('provision job missing operator_sealed'); }
+            $op = handoff_unseal($sealed);
+            $email = (string)($op['email'] ?? '');
+            if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                throw new OrreryError('handoff operator email invalid');
+            }
+            $federate = array_key_exists('federate', $payload) ? (bool)$payload['federate'] : true;
+            $opts = [
+                'operator-email' => $email,
+                'force' => true, // worker retries must be idempotent
+            ];
+            if (!empty($op['first']))            { $opts['operator-first'] = (string)$op['first']; }
+            if (!empty($op['last']))             { $opts['operator-last']  = (string)$op['last']; }
+            if (!empty($payload['site_name']))    { $opts['site-name']      = (string)$payload['site_name']; }
+            if (!empty($payload['site_tagline'])) { $opts['site-tagline']   = (string)$payload['site_tagline']; }
+            if (!empty($payload['locale']))       { $opts['locale']         = (string)$payload['locale']; }
+            if (!empty($payload['quota']))        { $opts['quota']          = (string)$payload['quota']; }
+            if (!$federate)                       { $opts['no-federate']    = true; }
+
+            worker_set_request_status($pdo, $requestId, 'provisioning');
+            cmd_provision($label, $opts);
+
+            // Read back the recorded keyid so the result + 3f auto-trust have it.
+            $reg = registry_load();
+            $keyid = $reg[$label]['keyid'] ?? null;
+            // instance_id stays NULL here; 3f records the federation instances
+            // row at provision time and backfills instance_requests.instance_id.
+            worker_set_request_status($pdo, $requestId, 'provisioned');
+            return ['action' => 'provision', 'label' => $label, 'keyid' => $keyid];
+
+        case 'deprovision':
+            cmd_deprovision($label, ['yes' => true]);
+            return ['action' => 'deprovision', 'label' => $label];
+
+        case 'suspend':
+            cmd_suspend($label);
+            return ['action' => 'suspend', 'label' => $label];
+
+        case 'resume':
+            cmd_resume($label);
+            return ['action' => 'resume', 'label' => $label];
+
+        default:
+            throw new OrreryError("unknown job_type '$jobType'");
+    }
+}
+
+function cmd_work(array $opts): void {
+    $max = isset($opts['max']) ? max(1, (int)$opts['max']) : WORKER_MAX_JOBS;
+    $pdo = pluriverse_pdo();
+    $done = 0; $failed = 0; $processed = 0;
+
+    for ($i = 0; $i < $max; $i++) {
+        $job = worker_claim_job($pdo);
+        if ($job === null) break; // queue drained
+        $processed++;
+        $jobId = (int)$job['id'];
+        $requestId = $job['request_id'] !== null ? (int)$job['request_id'] : null;
+        step("job#$jobId {$job['job_type']} '{$job['label']}' (attempt {$job['attempt_count']})");
+        try {
+            $result = worker_run_job($pdo, $job);
+            worker_finish_job($pdo, $jobId, $result);
+            $done++;
+            info("job#$jobId done");
+        } catch (Throwable $e) {
+            $outcome = worker_fail_job($pdo, $jobId, (int)$job['attempt_count'], $e->getMessage());
+            // On terminal give-up of a provision, surface the request as failed.
+            if ($outcome === 'given_up' && $job['job_type'] === 'provision') {
+                worker_set_request_status($pdo, $requestId, 'failed');
+            }
+            $failed++;
+            warn("job#$jobId $outcome: " . $e->getMessage());
+        }
+    }
+
+    if ($processed === 0) {
+        out('No due jobs.');
+    } else {
+        out("Worker pass complete: processed=$processed done=$done failed=$failed.");
+    }
+}
+
 function cmd_list(): void {
     $reg = registry_load();
     if (!$reg) { out('No instances in the registry.'); return; }
@@ -872,6 +1158,7 @@ function usage(): void {
     out('  telaris-orrery deprovision <label> [--yes]');
     out('  telaris-orrery suspend <label>');
     out('  telaris-orrery resume <label>');
+    out('  telaris-orrery work [--max=N]      drain the Pluriverse provisioning_jobs queue');
     out('  telaris-orrery list');
     out('  telaris-orrery inspect <label>');
 }
@@ -900,6 +1187,7 @@ try {
             if (!isset($pos[0])) { fail('resume needs a <label>.'); }
             cmd_resume($pos[0]);
             break;
+        case 'work':    cmd_work($opts); break;
         case 'list':    cmd_list(); break;
         case 'inspect':
             if (!isset($pos[0])) { fail('inspect needs a <label>.'); }
@@ -916,5 +1204,6 @@ try {
             exit(2);
     }
 } catch (Throwable $e) {
-    fail($e->getMessage());
+    fwrite(STDERR, "[x] " . $e->getMessage() . "\n");
+    exit(1);
 }

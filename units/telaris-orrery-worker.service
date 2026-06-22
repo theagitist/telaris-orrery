@@ -1,0 +1,13 @@
+[Unit]
+Description=Telaris Orrery provisioning worker (drains the Pluriverse job queue)
+Documentation=https://github.com/theagitist/telaris-orrery
+After=network-online.target
+
+[Service]
+Type=oneshot
+# %h expands to the Orrery user's home; no hardcoded username.
+ExecStart=%h/apps/telaris-orrery/bin/telaris-orrery work
+Nice=10
+# A single drain pass is short; cap it so a wedged podman call cannot hang
+# the timer forever (the next tick retries any still-queued job).
+TimeoutStartSec=600
