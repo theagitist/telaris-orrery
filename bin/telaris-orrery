@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 /**
- * telaris-fleet: programmatic provisioner for the Telaris self-service fleet.
+ * telaris-orrery: programmatic provisioner for the Telaris self-service instance plane.
  *
  * Phase 2 of the self-service-instances plan. Automates, idempotently and
  * reversibly, every step that was done by hand for the Phase-1 `fleet-test`
@@ -12,7 +12,7 @@ declare(strict_types=1);
  * lay out the bind-mount tree, render the .kube Quadlet + unit, start the pod
  * under rootless Podman/systemd, seed schema + operator programmatically
  * (bin/provision-init inside the container), wire the host nginx route, and
- * record the instance in a local fleet registry.
+ * record the instance in a local Orrery registry.
  *
  * Design (per the plan's Q5 trust boundary):
  *   - Every external process is run with an ARGUMENT ARRAY via proc_open, so no
@@ -22,11 +22,11 @@ declare(strict_types=1);
  *     password (random_bytes), both charset-asserted before use.
  *   - The single OS-root operation is `systemctl reload nginx` (+ a read-only
  *     `nginx -t` validation), via one narrow sudoers line. Everything else is
- *     the fleet user's own authority (rootless Podman, ~/.config systemd, a
+ *     the Orrery user's own authority (rootless Podman, ~/.config systemd, a
  *     PG role with CREATEDB/CREATEROLE) -- no elevation.
  *
- * Fleet user: the invoking user (owns the rootless Podman setup, subuid/subgid,
- * linger). A dedicated non-human fleet user is a later hardening.
+ * Orrery user: the invoking user (owns the rootless Podman setup, subuid/subgid,
+ * linger). A dedicated non-human Orrery user is a later hardening.
  *
  * Subcommands:
  *   provision   <label> --operator-email=E [opts]   create + start + seed + route
@@ -50,7 +50,7 @@ declare(strict_types=1);
 // ===========================================================================
 // Configuration (env-overridable; defaults match this box)
 // ===========================================================================
-const APP_DESC = 'telaris-fleet provisioner';
+const APP_DESC = 'telaris-orrery provisioner';
 
 function cfg(string $key, string $default): string {
     $v = getenv($key);
@@ -66,8 +66,8 @@ define('IMAGE_APP',      cfg('TELARIS_IMAGE_APP',      'localhost/telaris-app:de
 define('IMAGE_WEB',      cfg('TELARIS_IMAGE_WEB',      'localhost/telaris-web:dev'));
 define('WILDCARD_BASE',  cfg('TELARIS_WILDCARD_BASE',  'telaris.ca'));
 define('QUADLET_DIR',    cfg('TELARIS_QUADLET_DIR',    getenv('HOME') . '/.config/containers/systemd'));
-define('NGINX_FLEET_DIR',cfg('TELARIS_NGINX_FLEET_DIR','/etc/nginx/telaris-fleet'));
-define('REGISTRY_FILE',  cfg('TELARIS_FLEET_REGISTRY', dirname(__DIR__) . '/registry.json'));
+define('NGINX_ORRERY_DIR',cfg('TELARIS_NGINX_ORRERY_DIR','/etc/nginx/telaris-orrery'));
+define('REGISTRY_FILE',  cfg('TELARIS_ORRERY_REGISTRY', dirname(__DIR__) . '/registry.json'));
 define('MAIL_FROM_NAME', cfg('TELARIS_MAIL_FROM_NAME', 'Telaris'));
 define('PORT_MIN', (int)cfg('TELARIS_PORT_MIN', '18080'));
 define('PORT_MAX', (int)cfg('TELARIS_PORT_MAX', '18999'));
@@ -82,7 +82,7 @@ define('CURL', '/usr/bin/curl');
 define('TAR', '/usr/bin/tar');
 
 // Reserved labels that must never be provisioned (collide with real hosts /
-// special names). Extend as the fleet grows.
+// special names). Extend as the Orrery grows.
 const RESERVED_LABELS = [
     'www', 'mail', 'admin', 'api', 'ns', 'ns1', 'ns2', 'mx', 'ftp', 'smtp',
     'imap', 'pop', 'webmail', 'cpanel', 'whm', 'localhost', 'pluriverse',
@@ -331,7 +331,7 @@ function make_tree(string $label): void {
     foreach (['uploads', 'snapshots', 'logs', 'var', 'secrets', 'hg-content'] as $d) {
         if (!is_dir("$base/$d")) { mkdir("$base/$d", 0775, true); }
     }
-    // Host-fleet-user-owned config dir: holds the .kube YAML (which the host
+    // Host-Orrery-user-owned config dir: holds the .kube YAML (which the host
     // systemd reads on restart, so it must NOT be inside a container-chowned dir).
     if (!is_dir("$base/conf")) { mkdir("$base/conf", 0700, true); }
     foreach ([backups_dir($label) . '/db', backups_dir($label) . '/files'] as $d) {
@@ -463,7 +463,7 @@ function quadlet_path(string $label): string {
 function render_quadlet(string $label, string $yamlPath): string {
     return <<<UNIT
 [Unit]
-Description=Telaris fleet instance: $label
+Description=Telaris instance: $label
 After=network-online.target
 Wants=network-online.target
 
@@ -512,11 +512,11 @@ function curl_status(int $port): string {
 // nginx route
 // ===========================================================================
 
-function nginx_vhost_path(string $label): string { return NGINX_FLEET_DIR . '/' . $label . '.conf'; }
+function nginx_vhost_path(string $label): string { return NGINX_ORRERY_DIR . '/' . $label . '.conf'; }
 
 function render_vhost(string $label, string $hostname, int $port): string {
     return <<<NGINX
-# Telaris fleet instance: $label  (generated by telaris-fleet; do not edit)
+# Telaris instance: $label  (generated by telaris-orrery; do not edit)
 server {
     listen 80;
     listen [::]:80;
@@ -746,9 +746,9 @@ function cmd_deprovision(string $label, array $opts): void {
         step('archiving files (uploads + snapshots + secrets)');
         if (!is_dir(backups_dir($label) . '/files')) { mkdir(backups_dir($label) . '/files', 0775, true); }
         // The app entrypoint chowns the data dirs to www-data = host uid 100032
-        // in the rootless userns, so the fleet user cannot read them directly.
+        // in the rootless userns, so the Orrery user cannot read them directly.
         // `podman unshare` runs tar inside that user namespace (where 100032 maps
-        // to the fleet user), so we capture them faithfully WITHOUT OS root.
+        // to the Orrery user), so we capture them faithfully WITHOUT OS root.
         $tarball = backups_dir($label) . "/files/$label-$stamp.tar.zst";
         run_ok([PODMAN, 'unshare', TAR, '--zstd', '-cf', $tarball, '-C', INSTANCES_ROOT, $label],
             'podman unshare tar');
@@ -804,7 +804,7 @@ function cmd_suspend(string $label): void {
     systemd_user(['stop', service_name($label)], 'stop ' . service_name($label));
     $reg = registry_load();
     if (isset($reg[$label])) { $reg[$label]['status'] = 'suspended'; registry_save($reg); }
-    out("Suspended '$label' (data retained; resume with: telaris-fleet resume $label).");
+    out("Suspended '$label' (data retained; resume with: telaris-orrery resume $label).");
 }
 
 function cmd_resume(string $label): void {
@@ -867,19 +867,19 @@ function usage(): void {
     out(APP_DESC);
     out('');
     out('Usage:');
-    out('  telaris-fleet provision <label> --operator-email=E [--operator-first= --site-name= --locale=en');
+    out('  telaris-orrery provision <label> --operator-email=E [--operator-first= --site-name= --locale=en');
     out('                                   --password= --quota=N|infinite --no-federate --force --seed-script=PATH]');
-    out('  telaris-fleet deprovision <label> [--yes]');
-    out('  telaris-fleet suspend <label>');
-    out('  telaris-fleet resume <label>');
-    out('  telaris-fleet list');
-    out('  telaris-fleet inspect <label>');
+    out('  telaris-orrery deprovision <label> [--yes]');
+    out('  telaris-orrery suspend <label>');
+    out('  telaris-orrery resume <label>');
+    out('  telaris-orrery list');
+    out('  telaris-orrery inspect <label>');
 }
 
 [$cmd, $pos, $opts] = parse_args($argv);
 
 if (posix_getuid() === 0) {
-    fail('Do not run telaris-fleet as root; it is a rootless fleet-user tool (it uses sudo only for `systemctl reload nginx`).');
+    fail('Do not run telaris-orrery as root; it is a rootless Orrery-user tool (it uses sudo only for `systemctl reload nginx`).');
 }
 
 try {
