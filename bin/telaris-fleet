@@ -1,0 +1,920 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * telaris-fleet: programmatic provisioner for the Telaris self-service fleet.
+ *
+ * Phase 2 of the self-service-instances plan. Automates, idempotently and
+ * reversibly, every step that was done by hand for the Phase-1 `fleet-test`
+ * pod: validate the label, allocate a loopback port, create the
+ * telaris_<label> database + owning role on the managed PostgreSQL cluster,
+ * lay out the bind-mount tree, render the .kube Quadlet + unit, start the pod
+ * under rootless Podman/systemd, seed schema + operator programmatically
+ * (bin/provision-init inside the container), wire the host nginx route, and
+ * record the instance in a local fleet registry.
+ *
+ * Design (per the plan's Q5 trust boundary):
+ *   - Every external process is run with an ARGUMENT ARRAY via proc_open, so no
+ *     field is ever interpolated into a shell.
+ *   - Every database existence check is PARAMETERIZED SQL; the only values that
+ *     reach DDL are validated identifiers (label -> [a-z0-9_]) and a hex
+ *     password (random_bytes), both charset-asserted before use.
+ *   - The single OS-root operation is `systemctl reload nginx` (+ a read-only
+ *     `nginx -t` validation), via one narrow sudoers line. Everything else is
+ *     the fleet user's own authority (rootless Podman, ~/.config systemd, a
+ *     PG role with CREATEDB/CREATEROLE) -- no elevation.
+ *
+ * Fleet user: the invoking user (owns the rootless Podman setup, subuid/subgid,
+ * linger). A dedicated non-human fleet user is a later hardening.
+ *
+ * Subcommands:
+ *   provision   <label> --operator-email=E [opts]   create + start + seed + route
+ *   deprovision <label> [--yes]                      archive then destroy
+ *   suspend     <label>                              stop the pod (data retained)
+ *   resume      <label>                              start the pod again
+ *   list                                             registry table
+ *   inspect     <label>                              one instance, with live state
+ *   help
+ *
+ * provision opts:
+ *   --operator-first=, --operator-last=, --site-name=, --site-tagline=,
+ *   --locale=en|es|pt|fr, --password=<plain> (omit => magic-link/no-password),
+ *   --quota=<GB>|infinite (recorded only; enforcement is a later feature),
+ *   --federate / --no-federate (default: federate; records intent + mints keypair),
+ *   --force (re-run an existing label idempotently),
+ *   --seed-script=<path> (dev: podman cp this provision-init into the container
+ *                         instead of relying on the in-image copy).
+ */
+
+// ===========================================================================
+// Configuration (env-overridable; defaults match this box)
+// ===========================================================================
+const APP_DESC = 'telaris-fleet provisioner';
+
+function cfg(string $key, string $default): string {
+    $v = getenv($key);
+    return ($v !== false && $v !== '') ? $v : $default;
+}
+
+define('INSTANCES_ROOT', cfg('TELARIS_INSTANCES_ROOT', '/mnt/polivoxiadata/telaris-instances'));
+define('BACKUPS_ROOT',   cfg('TELARIS_BACKUPS_ROOT',   '/mnt/polivoxiadata/telaris-backups'));
+define('KEYS_DIR',       cfg('TELARIS_KEYS_DIR',       getenv('HOME') . '/apps/keys'));
+define('ADMIN_CREDS',    cfg('TELARIS_PG_ADMIN_CREDS', getenv('HOME') . '/apps/keys/managed-polivoxia-pg1-database'));
+define('DB_SSL_CA',      cfg('TELARIS_DB_SSL_CA',      '/etc/ssl/polivoxia-pg1-ca.crt'));
+define('IMAGE_APP',      cfg('TELARIS_IMAGE_APP',      'localhost/telaris-app:dev'));
+define('IMAGE_WEB',      cfg('TELARIS_IMAGE_WEB',      'localhost/telaris-web:dev'));
+define('WILDCARD_BASE',  cfg('TELARIS_WILDCARD_BASE',  'telaris.ca'));
+define('QUADLET_DIR',    cfg('TELARIS_QUADLET_DIR',    getenv('HOME') . '/.config/containers/systemd'));
+define('NGINX_FLEET_DIR',cfg('TELARIS_NGINX_FLEET_DIR','/etc/nginx/telaris-fleet'));
+define('REGISTRY_FILE',  cfg('TELARIS_FLEET_REGISTRY', dirname(__DIR__) . '/registry.json'));
+define('MAIL_FROM_NAME', cfg('TELARIS_MAIL_FROM_NAME', 'Telaris'));
+define('PORT_MIN', (int)cfg('TELARIS_PORT_MIN', '18080'));
+define('PORT_MAX', (int)cfg('TELARIS_PORT_MAX', '18999'));
+define('DEFAULT_QUOTA_GB', cfg('TELARIS_DEFAULT_QUOTA_GB', '5'));
+
+define('PG_DUMP', cfg('TELARIS_PG_DUMP', '/usr/lib/postgresql/18/bin/pg_dump'));
+define('PODMAN',  cfg('TELARIS_PODMAN', '/usr/bin/podman'));
+define('SYSTEMCTL', '/usr/bin/systemctl');
+define('SUDO', '/usr/bin/sudo');
+define('NGINX', '/usr/sbin/nginx');
+define('CURL', '/usr/bin/curl');
+define('TAR', '/usr/bin/tar');
+
+// Reserved labels that must never be provisioned (collide with real hosts /
+// special names). Extend as the fleet grows.
+const RESERVED_LABELS = [
+    'www', 'mail', 'admin', 'api', 'ns', 'ns1', 'ns2', 'mx', 'ftp', 'smtp',
+    'imap', 'pop', 'webmail', 'cpanel', 'whm', 'localhost', 'pluriverse',
+    'orrery', 'observatory', 'telaris', 'starmaps', 'grsj306', 'qwsp',
+    'fleet', 'test', 'staging', 'prod', 'production', 'root', 'postgres',
+];
+
+// ===========================================================================
+// Small utilities
+// ===========================================================================
+
+function out(string $s): void { fwrite(STDOUT, $s . "\n"); }
+function info(string $s): void { fwrite(STDOUT, "  " . $s . "\n"); }
+function step(string $s): void { fwrite(STDOUT, "[*] " . $s . "\n"); }
+function warn(string $s): void { fwrite(STDERR, "[!] " . $s . "\n"); }
+function fail(string $s): never { fwrite(STDERR, "[x] " . $s . "\n"); exit(1); }
+
+/** Session env so rootless `podman` / `systemctl --user` reach the user manager. */
+function user_env(): array {
+    $uid = posix_getuid();
+    $name = posix_getpwuid($uid)['name'] ?? '';
+    return [
+        'PATH' => getenv('PATH') ?: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        'HOME' => getenv('HOME') ?: ('/home/' . $name),
+        'XDG_RUNTIME_DIR' => '/run/user/' . $uid,
+        'DBUS_SESSION_BUS_ADDRESS' => 'unix:path=/run/user/' . $uid . '/bus',
+    ];
+}
+
+/**
+ * Run a process with an argument array (NO shell). Returns code/out/err.
+ * @param array<int,string> $cmd
+ * @param array<string,string> $extraEnv merged over user_env()
+ */
+function run(array $cmd, array $extraEnv = [], ?string $stdin = null): array {
+    $env = array_merge(user_env(), $extraEnv);
+    $desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open($cmd, $desc, $pipes, null, $env);
+    if (!is_resource($proc)) {
+        throw new RuntimeException('proc_open failed: ' . implode(' ', $cmd));
+    }
+    if ($stdin !== null) { fwrite($pipes[0], $stdin); }
+    fclose($pipes[0]);
+    $o = stream_get_contents($pipes[1]); fclose($pipes[1]);
+    $e = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    $code = proc_close($proc);
+    return ['code' => $code, 'out' => (string)$o, 'err' => (string)$e];
+}
+
+function run_ok(array $cmd, string $what, array $extraEnv = [], ?string $stdin = null): string {
+    $r = run($cmd, $extraEnv, $stdin);
+    if ($r['code'] !== 0) {
+        throw new RuntimeException("$what failed (exit {$r['code']}): " . trim($r['err'] ?: $r['out']));
+    }
+    return $r['out'];
+}
+
+// ===========================================================================
+// Validation + identifier safety
+// ===========================================================================
+
+function validate_label(string $label): string {
+    $label = strtolower(trim($label));
+    if (!preg_match('/^[a-z][a-z0-9-]{1,30}$/', $label)) {
+        fail("Invalid label '$label': must be lowercase, start with a letter, [a-z0-9-], 2-31 chars.");
+    }
+    if (str_contains($label, '--') || str_ends_with($label, '-')) {
+        fail("Invalid label '$label': no trailing or doubled hyphens.");
+    }
+    if (in_array($label, RESERVED_LABELS, true)) {
+        fail("Label '$label' is reserved.");
+    }
+    return $label;
+}
+
+/** DB + role name from a validated label (dashes -> underscores; telaris_ prefix). */
+function db_name_for(string $label): string {
+    $name = 'telaris_' . str_replace('-', '_', $label);
+    if (!preg_match('/^[a-z_][a-z0-9_]*$/', $name)) {
+        fail("Derived DB name '$name' is not a safe identifier."); // defence in depth
+    }
+    return $name;
+}
+
+/** Quote a PostgreSQL identifier (already charset-validated; double-quote + escape). */
+function pg_ident(string $id): string {
+    if (!preg_match('/^[a-z_][a-z0-9_]*$/', $id)) {
+        throw new RuntimeException("Refusing to quote unsafe identifier: $id");
+    }
+    return '"' . str_replace('"', '""', $id) . '"';
+}
+
+/** Quote a PG string literal. */
+function pg_lit(string $s): string {
+    return "'" . str_replace("'", "''", $s) . "'";
+}
+
+function assert_hex(string $s): void {
+    if (!preg_match('/^[0-9a-f]+$/', $s)) {
+        throw new RuntimeException('Expected a hex token; refusing.');
+    }
+}
+
+// ===========================================================================
+// Managed PostgreSQL admin
+// ===========================================================================
+
+/** @return array<string,string> */
+function admin_creds(): array {
+    if (!is_readable(ADMIN_CREDS)) {
+        fail('Managed PG admin creds not readable: ' . ADMIN_CREDS);
+    }
+    $creds = [];
+    foreach (file(ADMIN_CREDS, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        if (preg_match('/^\s*([a-zA-Z_]+)\s*=\s*(.*)$/', $line, $m)) {
+            $creds[strtolower($m[1])] = trim($m[2]);
+        }
+    }
+    foreach (['host', 'port', 'username', 'password', 'database'] as $k) {
+        if (!isset($creds[$k])) {
+            fail("Managed PG admin creds missing '$k'.");
+        }
+    }
+    $creds['sslmode'] = $creds['sslmode'] ?? 'require';
+    return $creds;
+}
+
+function admin_pdo(?string $dbname = null): PDO {
+    $c = admin_creds();
+    $db = $dbname ?? $c['database'];
+    $dsn = "pgsql:host={$c['host']};port={$c['port']};dbname={$db};sslmode={$c['sslmode']}";
+    if (is_readable(DB_SSL_CA)) {
+        $dsn .= ';sslrootcert=' . DB_SSL_CA;
+    }
+    return new PDO($dsn, $c['username'], $c['password'], [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_TIMEOUT => 15,
+    ]);
+}
+
+function pg_role_exists(PDO $pdo, string $role): bool {
+    $s = $pdo->prepare('SELECT 1 FROM pg_roles WHERE rolname = :r');
+    $s->execute([':r' => $role]);
+    return (bool)$s->fetchColumn();
+}
+
+function pg_db_exists(PDO $pdo, string $db): bool {
+    $s = $pdo->prepare('SELECT 1 FROM pg_database WHERE datname = :d');
+    $s->execute([':d' => $db]);
+    return (bool)$s->fetchColumn();
+}
+
+function db_provision(string $dbName, string $dbUser, string $dbPass): void {
+    assert_hex($dbPass);
+    $pdo = admin_pdo();
+    if (!pg_role_exists($pdo, $dbUser)) {
+        step("creating role $dbUser");
+        $pdo->exec(sprintf('CREATE ROLE %s LOGIN PASSWORD %s', pg_ident($dbUser), pg_lit($dbPass)));
+    } else {
+        info("role $dbUser already exists");
+    }
+    if (!pg_db_exists($pdo, $dbName)) {
+        step("creating database $dbName");
+        $pdo->exec(sprintf('CREATE DATABASE %s OWNER %s', pg_ident($dbName), pg_ident($dbUser)));
+    } else {
+        info("database $dbName already exists");
+    }
+    $idb = admin_pdo($dbName);
+    $idb->exec('CREATE EXTENSION IF NOT EXISTS unaccent');
+    info('unaccent extension ensured');
+}
+
+function db_dump(string $dbName, string $destFile): void {
+    $c = admin_creds();
+    $env = [
+        'PGPASSWORD' => $c['password'],
+        'PGSSLMODE' => $c['sslmode'],
+        'PGSSLROOTCERT' => DB_SSL_CA,
+    ];
+    run_ok(
+        [PG_DUMP, '-h', $c['host'], '-p', $c['port'], '-U', $c['username'], '-Fc', '-f', $destFile, $dbName],
+        "pg_dump $dbName",
+        $env
+    );
+}
+
+function db_drop(string $dbName, string $dbUser): void {
+    $pdo = admin_pdo();
+    if (pg_db_exists($pdo, $dbName)) {
+        step("dropping database $dbName (FORCE)");
+        // PG13+ FORCE terminates remaining backends automatically.
+        $pdo->exec(sprintf('DROP DATABASE IF EXISTS %s WITH (FORCE)', pg_ident($dbName)));
+    }
+    if (pg_role_exists($pdo, $dbUser)) {
+        step("dropping role $dbUser");
+        $pdo->exec(sprintf('DROP ROLE IF EXISTS %s', pg_ident($dbUser)));
+    }
+}
+
+// ===========================================================================
+// Registry (local JSON; the Pluriverse `instances` table supersedes it later)
+// ===========================================================================
+
+/** @return array<string,array<string,mixed>> */
+function registry_load(): array {
+    if (!is_file(REGISTRY_FILE)) {
+        return [];
+    }
+    $data = json_decode((string)file_get_contents(REGISTRY_FILE), true);
+    return is_array($data) ? $data : [];
+}
+
+function registry_save(array $reg): void {
+    ksort($reg);
+    $tmp = REGISTRY_FILE . '.tmp';
+    file_put_contents($tmp, json_encode($reg, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+    chmod($tmp, 0600);
+    rename($tmp, REGISTRY_FILE);
+}
+
+function allocate_port(array $reg): int {
+    $used = [];
+    foreach ($reg as $r) {
+        if (isset($r['port'])) { $used[(int)$r['port']] = true; }
+    }
+    for ($p = PORT_MIN; $p <= PORT_MAX; $p++) {
+        if (isset($used[$p])) { continue; }
+        $sock = @fsockopen('127.0.0.1', $p, $errno, $errstr, 0.2);
+        if ($sock !== false) { fclose($sock); continue; } // something is listening
+        return $p;
+    }
+    fail('No free port in range ' . PORT_MIN . '-' . PORT_MAX);
+}
+
+// ===========================================================================
+// Filesystem layout
+// ===========================================================================
+
+function instance_dir(string $label): string { return INSTANCES_ROOT . '/' . $label; }
+function backups_dir(string $label): string { return BACKUPS_ROOT . '/' . $label; }
+
+function make_tree(string $label): void {
+    $base = instance_dir($label);
+    // Container-written data dirs (the app entrypoint chowns these to www-data
+    // = host uid 100032 in the rootless userns).
+    foreach (['uploads', 'snapshots', 'logs', 'var', 'secrets', 'hg-content'] as $d) {
+        if (!is_dir("$base/$d")) { mkdir("$base/$d", 0775, true); }
+    }
+    // Host-fleet-user-owned config dir: holds the .kube YAML (which the host
+    // systemd reads on restart, so it must NOT be inside a container-chowned dir).
+    if (!is_dir("$base/conf")) { mkdir("$base/conf", 0700, true); }
+    foreach ([backups_dir($label) . '/db', backups_dir($label) . '/files'] as $d) {
+        if (!is_dir($d)) { mkdir($d, 0775, true); }
+    }
+}
+
+// ===========================================================================
+// .kube YAML + Quadlet unit
+// ===========================================================================
+
+/**
+ * @param array<string,string> $envPairs
+ */
+function render_kube_yaml(string $label, int $port, array $envPairs): string {
+    $base = instance_dir($label);
+    $pod = 'telaris-' . $label;
+
+    $envBlock = function (string $indent) use ($envPairs): string {
+        $lines = [];
+        foreach ($envPairs as $k => $v) {
+            $lines[] = $indent . "- name: $k";
+            $lines[] = $indent . "  value: " . pg_lit_yaml($v);
+        }
+        return implode("\n", $lines);
+    };
+
+    // The data volume mounts shared by app + cron.
+    $mounts = [
+        ['uploads',   '/var/www/html/uploads'],
+        ['snapshots', '/var/www/html/telaris-snapshots'],
+        ['logs',      '/var/www/html/logs'],
+        ['var',       '/var/www/html/var'],
+        ['secrets',   '/var/www/html/secrets'],
+        ['hgcontent', '/var/www/html/hg/content'],
+    ];
+    $mountBlock = function (string $indent) use ($mounts): string {
+        $lines = [];
+        foreach ($mounts as [$name, $path]) {
+            $lines[] = $indent . "- name: $name";
+            $lines[] = $indent . "  mountPath: $path";
+        }
+        $lines[] = $indent . "- name: ca";
+        $lines[] = $indent . "  mountPath: " . DB_SSL_CA;
+        $lines[] = $indent . "  readOnly: true";
+        return implode("\n", $lines);
+    };
+
+    $hostPaths = [
+        ['uploads',   "$base/uploads"],
+        ['snapshots', "$base/snapshots"],
+        ['logs',      "$base/logs"],
+        ['var',       "$base/var"],
+        ['secrets',   "$base/secrets"],
+        ['hgcontent', "$base/hg-content"],
+    ];
+    $volLines = [];
+    foreach ($hostPaths as [$name, $path]) {
+        $volLines[] = "    - name: $name";
+        $volLines[] = "      hostPath:";
+        $volLines[] = "        path: $path";
+        $volLines[] = "        type: Directory";
+    }
+    $volLines[] = "    - name: ca";
+    $volLines[] = "      hostPath:";
+    $volLines[] = "        path: " . DB_SSL_CA;
+    $volLines[] = "        type: File";
+    $volumes = implode("\n", $volLines);
+
+    $env6 = $envBlock('        ');
+    $mounts8 = $mountBlock('        ');
+    $imgApp = IMAGE_APP;
+    $imgWeb = IMAGE_WEB;
+
+    return <<<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+  labels:
+    app: $pod
+spec:
+  hostAliases:
+    - ip: 127.0.0.1
+      hostnames:
+        - app
+  containers:
+    - name: app
+      image: $imgApp
+      args:
+        - php-fpm
+      env:
+$env6
+      ports:
+        - containerPort: 80
+          hostIP: 127.0.0.1
+          hostPort: $port
+      volumeMounts:
+$mounts8
+    - name: web
+      image: $imgWeb
+      args:
+        - nginx
+        - "-g"
+        - "daemon off;"
+    - name: cron
+      image: $imgApp
+      command:
+        - /usr/local/bin/entrypoint-cron.sh
+      env:
+$env6
+      volumeMounts:
+$mounts8
+  volumes:
+$volumes
+
+YAML;
+}
+
+/** Quote a YAML scalar value safely (single-quoted, doubled internal quotes). */
+function pg_lit_yaml(string $v): string {
+    return "'" . str_replace("'", "''", $v) . "'";
+}
+
+function quadlet_path(string $label): string {
+    return QUADLET_DIR . '/telaris-' . $label . '.kube';
+}
+
+function render_quadlet(string $label, string $yamlPath): string {
+    return <<<UNIT
+[Unit]
+Description=Telaris fleet instance: $label
+After=network-online.target
+Wants=network-online.target
+
+[Kube]
+Yaml=$yamlPath
+
+[Install]
+WantedBy=default.target
+
+UNIT;
+}
+
+// ===========================================================================
+// Pod lifecycle helpers
+// ===========================================================================
+
+function service_name(string $label): string { return 'telaris-' . $label . '.service'; }
+function app_container(string $label): string { return 'telaris-' . $label . '-app'; }
+
+function systemd_user(array $args, string $what): string {
+    return run_ok(array_merge([SYSTEMCTL, '--user'], $args), $what);
+}
+
+function wait_http(int $port, int $timeoutSec = 120): string {
+    $deadline = time() + $timeoutSec;
+    $last = '000';
+    while (time() < $deadline) {
+        $r = run([CURL, '-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '5',
+                  "http://127.0.0.1:$port/"]);
+        $last = trim($r['out']);
+        if ($last !== '000' && $last !== '') {
+            return $last;
+        }
+        usleep(2_000_000);
+    }
+    return $last;
+}
+
+function curl_status(int $port): string {
+    $r = run([CURL, '-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '8',
+              "http://127.0.0.1:$port/"]);
+    return trim($r['out']);
+}
+
+// ===========================================================================
+// nginx route
+// ===========================================================================
+
+function nginx_vhost_path(string $label): string { return NGINX_FLEET_DIR . '/' . $label . '.conf'; }
+
+function render_vhost(string $label, string $hostname, int $port): string {
+    return <<<NGINX
+# Telaris fleet instance: $label  (generated by telaris-fleet; do not edit)
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $hostname;
+    client_max_body_size 55m;
+
+    location / {
+        proxy_pass http://127.0.0.1:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+
+NGINX;
+}
+
+function nginx_reload(): void {
+    // read-only validation first (harmless, no privilege-escalation surface)
+    $t = run([SUDO, '-n', NGINX, '-t']);
+    if ($t['code'] !== 0) {
+        throw new RuntimeException('nginx -t failed; not reloading: ' . trim($t['err'] ?: $t['out']));
+    }
+    run_ok([SUDO, '-n', SYSTEMCTL, 'reload', 'nginx'], 'systemctl reload nginx');
+}
+
+// ===========================================================================
+// provision
+// ===========================================================================
+
+/** @param array<string,string|bool> $opts */
+function cmd_provision(string $label, array $opts): void {
+    $label = validate_label($label);
+    $email = (string)($opts['operator-email'] ?? '');
+    if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        fail('--operator-email=<valid email> is required for provision.');
+    }
+    $force = !empty($opts['force']);
+    $federate = !array_key_exists('no-federate', $opts);
+
+    $reg = registry_load();
+    if (isset($reg[$label]) && !$force) {
+        fail("Instance '$label' already in the registry. Use --force to re-run idempotently.");
+    }
+
+    $dbName = db_name_for($label);
+    $dbUser = $dbName;
+    $hostname = $label . '.' . WILDCARD_BASE;
+    $port = isset($reg[$label]['port']) ? (int)$reg[$label]['port'] : allocate_port($reg);
+
+    out("Provisioning instance '$label'");
+    info("hostname: $hostname");
+    info("database: $dbName  role: $dbUser");
+    info("port:     127.0.0.1:$port");
+
+    // --- DB role password: reuse keyfile if present, else generate ---
+    $keyfile = KEYS_DIR . '/telaris-' . $label . '-postgres';
+    if (is_file($keyfile)) {
+        $dbPass = trim((string)file_get_contents($keyfile));
+        info("reusing existing DB password keyfile");
+    } else {
+        $dbPass = bin2hex(random_bytes(24));
+        file_put_contents($keyfile, $dbPass . "\n");
+        chmod($keyfile, 0600);
+        info("wrote DB password keyfile: $keyfile (600)");
+    }
+    assert_hex($dbPass);
+
+    // --- managed PG: role + database + unaccent ---
+    db_provision($dbName, $dbUser, $dbPass);
+
+    // --- filesystem tree ---
+    step('creating instance tree under ' . instance_dir($label));
+    make_tree($label);
+
+    // --- render .kube YAML (host-owned conf/) + Quadlet unit ---
+    $envPairs = [
+        'DB_HOST' => admin_creds()['host'],
+        'DB_PORT' => admin_creds()['port'],
+        'DB_NAME' => $dbName,
+        'DB_USER' => $dbUser,
+        'DB_PASS' => $dbPass,
+        'DB_SSL_CA' => DB_SSL_CA,
+        'TELARIS_HOSTNAME' => $hostname,
+        'MAIL_FROM_NAME' => MAIL_FROM_NAME,
+    ];
+    $yamlPath = instance_dir($label) . '/conf/' . $label . '.kube.yaml';
+    file_put_contents($yamlPath, render_kube_yaml($label, $port, $envPairs));
+    chmod($yamlPath, 0600);
+    info("wrote $yamlPath (600)");
+
+    if (!is_dir(QUADLET_DIR)) { mkdir(QUADLET_DIR, 0755, true); }
+    file_put_contents(quadlet_path($label), render_quadlet($label, $yamlPath));
+    info('wrote Quadlet unit ' . quadlet_path($label));
+
+    // --- systemd: reload + start ---
+    step('systemctl --user daemon-reload');
+    systemd_user(['daemon-reload'], 'daemon-reload');
+    step('starting ' . service_name($label));
+    systemd_user(['start', service_name($label)], 'start ' . service_name($label));
+
+    // --- wait for the web server to answer ---
+    step("waiting for the pod to answer on 127.0.0.1:$port ...");
+    $code = wait_http($port);
+    if ($code === '000' || $code === '') {
+        fail("Pod did not answer on port $port. Check: systemctl --user status " . service_name($label));
+    }
+    info("pod answers (HTTP $code)");
+
+    // --- dev convenience: copy a provision-init into the container ---
+    if (!empty($opts['seed-script'])) {
+        $src = (string)$opts['seed-script'];
+        if (!is_file($src)) { fail("--seed-script not found: $src"); }
+        step('copying provision-init into the container');
+        run_ok([PODMAN, 'cp', $src, app_container($label) . ':/var/www/html/bin/provision-init'], 'podman cp provision-init');
+        run_ok([PODMAN, 'exec', app_container($label), 'chmod', '0755', '/var/www/html/bin/provision-init'], 'chmod provision-init');
+    }
+
+    // --- seed schema + operator programmatically (inside the container) ---
+    step('seeding schema + operator (bin/provision-init)');
+    $initArgs = [
+        PODMAN, 'exec', app_container($label),
+        'php', '/var/www/html/bin/provision-init',
+        '--operator-email=' . $email,
+    ];
+    if (!empty($opts['operator-first'])) { $initArgs[] = '--operator-first=' . $opts['operator-first']; }
+    if (!empty($opts['operator-last']))  { $initArgs[] = '--operator-last=' . $opts['operator-last']; }
+    if (!empty($opts['site-name']))      { $initArgs[] = '--site-name=' . $opts['site-name']; }
+    if (!empty($opts['site-tagline']))   { $initArgs[] = '--site-tagline=' . $opts['site-tagline']; }
+    if (!empty($opts['locale']))         { $initArgs[] = '--locale=' . $opts['locale']; }
+    if (!empty($opts['password']))       { $initArgs[] = '--password=' . $opts['password']; }
+    $r = run($initArgs);
+    fwrite(STDOUT, $r['out']);
+    if ($r['err'] !== '') { fwrite(STDERR, $r['err']); }
+    if ($r['code'] !== 0) {
+        fail('provision-init failed; instance left running for inspection.');
+    }
+    if (preg_match('/PROVISION_INIT_RESULT:(\{.*\})/', $r['out'], $m)) {
+        $res = json_decode($m[1], true);
+        info('seed: operator=' . ($res['operator'] ?? '?')
+            . ', tables_created=' . count($res['tables_created'] ?? [])
+            . ', db_ensure_ran=' . ($res['db_ensure_ran'] ?? '?'));
+    }
+
+    // --- verify home now serves 200 ---
+    $code = curl_status($port);
+    info("home now returns HTTP $code" . ($code === '200' ? ' (seeded OK)' : ' (expected 200)'));
+
+    // --- host nginx route ---
+    step("writing nginx vhost for $hostname");
+    file_put_contents(nginx_vhost_path($label), render_vhost($label, $hostname, $port));
+    nginx_reload();
+    info('nginx reloaded');
+
+    // --- federation identity (minted by the entrypoint; report it) ---
+    $keyid = '(pending)';
+    $r = run([PODMAN, 'exec', app_container($label), 'php', '-r',
+        'require_once "/var/www/html/config.php"; '
+        . 'require_once "/var/www/html/inc/federation/identity.php"; '
+        . 'echo federation_keyid(federation_local_hostname());']);
+    if (trim($r['out']) !== '' && !str_contains($r['out'], 'error')) { $keyid = trim($r['out']); }
+
+    // --- registry record ---
+    $reg = registry_load();
+    $reg[$label] = [
+        'label' => $label,
+        'hostname' => $hostname,
+        'port' => $port,
+        'db_name' => $dbName,
+        'db_user' => $dbUser,
+        'status' => 'running',
+        'federate' => $federate,
+        'keyid' => $keyid,
+        'quota' => (string)($opts['quota'] ?? DEFAULT_QUOTA_GB),
+        'operator_email' => $email,
+        'created' => gmdate('c'),
+    ];
+    registry_save($reg);
+
+    out('');
+    out("Provisioned '$label'.");
+    info("URL (local): curl -H 'Host: $hostname' http://127.0.0.1:$port/   (or via the host vhost once DNS resolves)");
+    info("federation keyid: $keyid");
+    if ($federate) {
+        info('federation: opted IN -- keypair minted; Pluriverse auto-trust wiring is Phase 3 (not yet recorded on the Pluriverse).');
+    }
+    info('quota: ' . ($reg[$label]['quota']) . ' (recorded only; enforcement is a later feature)');
+    if (empty($opts['password'])) {
+        info('operator has NO password (magic-link login); configure SMTP + trigger a login link, or re-provision with --password=.');
+    }
+}
+
+// ===========================================================================
+// deprovision
+// ===========================================================================
+
+function cmd_deprovision(string $label, array $opts): void {
+    $label = validate_label($label);
+    $reg = registry_load();
+    $rec = $reg[$label] ?? null;
+    $dbName = $rec['db_name'] ?? db_name_for($label);
+    $dbUser = $rec['db_user'] ?? $dbName;
+
+    if (empty($opts['yes'])) {
+        out("About to DEPROVISION '$label':");
+        info("- archive DB dump + files to " . backups_dir($label));
+        info("- stop + remove the pod and its Quadlet unit");
+        info("- DROP database $dbName + role $dbUser on managed PG");
+        info("- remove the instance tree " . instance_dir($label) . " and the nginx route");
+        fwrite(STDOUT, "Type the label to confirm: ");
+        $ans = trim((string)fgets(STDIN));
+        if ($ans !== $label) { fail('Confirmation did not match; aborted.'); }
+    }
+
+    $stamp = gmdate('Ymd-His');
+
+    // --- archive FIRST (data loss is not acceptable) ---
+    if (pg_db_exists(admin_pdo(), $dbName)) {
+        step("archiving DB dump");
+        if (!is_dir(backups_dir($label) . '/db')) { mkdir(backups_dir($label) . '/db', 0775, true); }
+        db_dump($dbName, backups_dir($label) . "/db/$dbName-$stamp.dump");
+        info('DB archived');
+    }
+    if (is_dir(instance_dir($label))) {
+        step('archiving files (uploads + snapshots + secrets)');
+        if (!is_dir(backups_dir($label) . '/files')) { mkdir(backups_dir($label) . '/files', 0775, true); }
+        // The app entrypoint chowns the data dirs to www-data = host uid 100032
+        // in the rootless userns, so the fleet user cannot read them directly.
+        // `podman unshare` runs tar inside that user namespace (where 100032 maps
+        // to the fleet user), so we capture them faithfully WITHOUT OS root.
+        $tarball = backups_dir($label) . "/files/$label-$stamp.tar.zst";
+        run_ok([PODMAN, 'unshare', TAR, '--zstd', '-cf', $tarball, '-C', INSTANCES_ROOT, $label],
+            'podman unshare tar');
+        info("files archived: $tarball");
+    }
+
+    // --- stop + remove the pod ---
+    if (is_file(quadlet_path($label))) {
+        step('stopping ' . service_name($label));
+        run([SYSTEMCTL, '--user', 'stop', service_name($label)], user_env()); // ignore if already stopped
+        unlink(quadlet_path($label));
+        systemd_user(['daemon-reload'], 'daemon-reload');
+        info('pod stopped + Quadlet unit removed');
+    }
+    // Belt-and-braces: remove any lingering pod object.
+    run([PODMAN, 'pod', 'rm', '-f', 'telaris-' . $label]);
+
+    // --- nginx route ---
+    if (is_file(nginx_vhost_path($label))) {
+        step('removing nginx route');
+        unlink(nginx_vhost_path($label));
+        nginx_reload();
+        info('nginx reloaded');
+    }
+
+    // --- drop DB + role ---
+    db_drop($dbName, $dbUser);
+
+    // --- remove the live tree (NOT the backups) ---
+    if (is_dir(instance_dir($label))) {
+        step('removing instance tree');
+        // Same userns reason as the archive step: the data dirs are owned by
+        // uid 100032, so remove them inside `podman unshare` (no OS root).
+        run_ok([PODMAN, 'unshare', '/usr/bin/rm', '-rf', instance_dir($label)], 'podman unshare rm -rf');
+        info('tree removed (backups kept under ' . backups_dir($label) . ')');
+    }
+
+    // --- keyfile + registry ---
+    $keyfile = KEYS_DIR . '/telaris-' . $label . '-postgres';
+    if (is_file($keyfile)) { unlink($keyfile); info('removed DB keyfile'); }
+    unset($reg[$label]);
+    registry_save($reg);
+
+    out("Deprovisioned '$label'. Final archives under " . backups_dir($label));
+}
+
+// ===========================================================================
+// suspend / resume / list / inspect
+// ===========================================================================
+
+function cmd_suspend(string $label): void {
+    $label = validate_label($label);
+    systemd_user(['stop', service_name($label)], 'stop ' . service_name($label));
+    $reg = registry_load();
+    if (isset($reg[$label])) { $reg[$label]['status'] = 'suspended'; registry_save($reg); }
+    out("Suspended '$label' (data retained; resume with: telaris-fleet resume $label).");
+}
+
+function cmd_resume(string $label): void {
+    $label = validate_label($label);
+    systemd_user(['start', service_name($label)], 'start ' . service_name($label));
+    $reg = registry_load();
+    if (isset($reg[$label])) {
+        $reg[$label]['status'] = 'running';
+        registry_save($reg);
+        info('pod answers (HTTP ' . wait_http((int)$reg[$label]['port'], 60) . ')');
+    }
+    out("Resumed '$label'.");
+}
+
+function cmd_list(): void {
+    $reg = registry_load();
+    if (!$reg) { out('No instances in the registry.'); return; }
+    printf("%-16s %-26s %-7s %-22s %-10s %s\n", 'LABEL', 'HOSTNAME', 'PORT', 'DB', 'STATUS', 'LIVE');
+    foreach ($reg as $r) {
+        $live = isset($r['port']) ? curl_status((int)$r['port']) : '-';
+        printf("%-16s %-26s %-7s %-22s %-10s %s\n",
+            $r['label'] ?? '?', $r['hostname'] ?? '?', (string)($r['port'] ?? '?'),
+            $r['db_name'] ?? '?', $r['status'] ?? '?', $live);
+    }
+}
+
+function cmd_inspect(string $label): void {
+    $label = validate_label($label);
+    $reg = registry_load();
+    $rec = $reg[$label] ?? null;
+    if (!$rec) { fail("No registry record for '$label'."); }
+    $rec['live_http'] = isset($rec['port']) ? curl_status((int)$rec['port']) : '-';
+    $svc = run([SYSTEMCTL, '--user', 'is-active', service_name($label)], user_env());
+    $rec['unit_active'] = trim($svc['out']);
+    out(json_encode($rec, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+}
+
+// ===========================================================================
+// arg parsing + dispatch
+// ===========================================================================
+
+/** @return array{0:string,1:array<int,string>,2:array<string,string|bool>} */
+function parse_args(array $argv): array {
+    $cmd = $argv[1] ?? 'help';
+    $positional = [];
+    $opts = [];
+    foreach (array_slice($argv, 2) as $arg) {
+        if (preg_match('/^--([a-z][a-z-]*)=(.*)$/s', $arg, $m)) {
+            $opts[$m[1]] = $m[2];
+        } elseif (preg_match('/^--([a-z][a-z-]*)$/', $arg, $m)) {
+            $opts[$m[1]] = true;
+        } else {
+            $positional[] = $arg;
+        }
+    }
+    return [$cmd, $positional, $opts];
+}
+
+function usage(): void {
+    out(APP_DESC);
+    out('');
+    out('Usage:');
+    out('  telaris-fleet provision <label> --operator-email=E [--operator-first= --site-name= --locale=en');
+    out('                                   --password= --quota=N|infinite --no-federate --force --seed-script=PATH]');
+    out('  telaris-fleet deprovision <label> [--yes]');
+    out('  telaris-fleet suspend <label>');
+    out('  telaris-fleet resume <label>');
+    out('  telaris-fleet list');
+    out('  telaris-fleet inspect <label>');
+}
+
+[$cmd, $pos, $opts] = parse_args($argv);
+
+if (posix_getuid() === 0) {
+    fail('Do not run telaris-fleet as root; it is a rootless fleet-user tool (it uses sudo only for `systemctl reload nginx`).');
+}
+
+try {
+    switch ($cmd) {
+        case 'provision':
+            if (!isset($pos[0])) { fail('provision needs a <label>.'); }
+            cmd_provision($pos[0], $opts);
+            break;
+        case 'deprovision':
+            if (!isset($pos[0])) { fail('deprovision needs a <label>.'); }
+            cmd_deprovision($pos[0], $opts);
+            break;
+        case 'suspend':
+            if (!isset($pos[0])) { fail('suspend needs a <label>.'); }
+            cmd_suspend($pos[0]);
+            break;
+        case 'resume':
+            if (!isset($pos[0])) { fail('resume needs a <label>.'); }
+            cmd_resume($pos[0]);
+            break;
+        case 'list':    cmd_list(); break;
+        case 'inspect':
+            if (!isset($pos[0])) { fail('inspect needs a <label>.'); }
+            cmd_inspect($pos[0]);
+            break;
+        case 'help':
+        case '--help':
+        case '-h':
+            usage();
+            break;
+        default:
+            warn("Unknown command: $cmd");
+            usage();
+            exit(2);
+    }
+} catch (Throwable $e) {
+    fail($e->getMessage());
+}
