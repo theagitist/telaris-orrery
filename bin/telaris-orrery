@@ -1008,6 +1008,46 @@ function worker_set_request_status(PDO $pdo, ?int $requestId, string $status, ?i
     $stmt->execute($params);
 }
 
+/**
+ * 3f auto-trust backfill: read the raw federation public key the freshly
+ * provisioned instance minted, and publish its (previously PENDING) Pluriverse
+ * `instances` row by writing the key and flipping admission_status to
+ * 'published'. The Pluriverse pre-created the row at approval (it holds the PII
+ * master key the worker lacks) and left public_key empty + status 'pending';
+ * this fills the one piece only the running instance can supply.
+ *
+ * Returns the keyid on success, or null if the key could not be read or the
+ * row was not in 'pending' (e.g. already published on a retry). Non-fatal: the
+ * instance is already serving; auto-trust can be reconciled later.
+ */
+function worker_publish_instance(PDO $pdo, int $instanceId, string $label): ?string {
+    // Raw 32-byte Ed25519 public key, hex-encoded, from inside the container.
+    $r = run([PODMAN, 'exec', app_container($label), 'php', '-r',
+        'require_once "/var/www/html/config.php"; '
+        . 'require_once "/var/www/html/inc/federation/identity.php"; '
+        . 'echo bin2hex(federation_public_key());']);
+    $pkHex = trim($r['out']);
+    if (!preg_match('/^[0-9a-f]{64}$/', $pkHex)) {
+        warn("3f: could not read public key for '$label' (got " . substr($pkHex, 0, 80) . '); leaving instances row pending');
+        return null;
+    }
+    // Backfill + publish only if still pending (idempotent across retries).
+    $stmt = $pdo->prepare("
+        UPDATE instances
+        SET public_key = decode(:pk, 'hex'), admission_status = 'published', last_seen_at = NOW()
+        WHERE id = :id AND admission_status = 'pending'
+        RETURNING hostname
+    ");
+    $stmt->execute([':pk' => $pkHex, ':id' => $instanceId]);
+    $host = $stmt->fetchColumn();
+    if ($host === false) {
+        info("3f: instances row #$instanceId for '$label' was not pending (already published?); no change");
+        return null;
+    }
+    info("3f: published instances row #$instanceId ($host) with minted key");
+    return (string)$host . ':' . substr($pkHex, 0, 16);
+}
+
 /** Run one claimed job to completion. Throws on failure (caller records it). */
 function worker_run_job(PDO $pdo, array $job): array {
     $jobType = (string)$job['job_type'];
@@ -1045,13 +1085,26 @@ function worker_run_job(PDO $pdo, array $job): array {
             worker_set_request_status($pdo, $requestId, 'provisioning');
             cmd_provision($label, $opts);
 
-            // Read back the recorded keyid so the result + 3f auto-trust have it.
+            // Read back the recorded keyid for the job result.
             $reg = registry_load();
             $keyid = $reg[$label]['keyid'] ?? null;
-            // instance_id stays NULL here; 3f records the federation instances
-            // row at provision time and backfills instance_requests.instance_id.
+
+            // 3f auto-trust: if the Pluriverse pre-created a (pending) federation
+            // instances row at approval, backfill its minted public key and
+            // publish it. instance_id is already linked on the request by the
+            // approve step; the publish is non-fatal if it cannot complete.
+            $published = null;
+            $instanceId = isset($payload['instance_id']) ? (int)$payload['instance_id'] : 0;
+            if ($federate && $instanceId > 0) {
+                try {
+                    $published = worker_publish_instance($pdo, $instanceId, $label);
+                } catch (Throwable $e) {
+                    warn('3f publish failed (non-fatal): ' . $e->getMessage());
+                }
+            }
+
             worker_set_request_status($pdo, $requestId, 'provisioned');
-            return ['action' => 'provision', 'label' => $label, 'keyid' => $keyid];
+            return ['action' => 'provision', 'label' => $label, 'keyid' => $keyid, 'published' => $published];
 
         case 'deprovision':
             cmd_deprovision($label, ['yes' => true]);
