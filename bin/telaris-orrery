@@ -657,6 +657,7 @@ function cmd_provision(string $label, array $opts): void {
     make_tree($label);
 
     // --- render .kube YAML (host-owned conf/) + Quadlet unit ---
+    $quotaStr = (string)($opts['quota'] ?? DEFAULT_QUOTA_GB);
     $envPairs = [
         'DB_HOST' => admin_creds()['host'],
         'DB_PORT' => admin_creds()['port'],
@@ -666,6 +667,8 @@ function cmd_provision(string $label, array $opts): void {
         'DB_SSL_CA' => DB_SSL_CA,
         'TELARIS_HOSTNAME' => $hostname,
         'MAIL_FROM_NAME' => MAIL_FROM_NAME,
+        // Disk quota the instance app self-enforces at upload time (0 = unlimited).
+        'TELARIS_QUOTA_BYTES' => (string)quota_bytes($quotaStr),
     ];
     $yamlPath = instance_dir($label) . '/conf/' . $label . '.kube.yaml';
     file_put_contents($yamlPath, render_kube_yaml($label, $port, $envPairs));
@@ -754,7 +757,7 @@ function cmd_provision(string $label, array $opts): void {
         'status' => 'running',
         'federate' => $federate,
         'keyid' => $keyid,
-        'quota' => (string)($opts['quota'] ?? DEFAULT_QUOTA_GB),
+        'quota' => $quotaStr,
         'operator_email' => $email,
         'created' => gmdate('c'),
     ];
@@ -780,7 +783,7 @@ function cmd_provision(string $label, array $opts): void {
             info('federation: opted IN, keypair minted; Pluriverse row not recorded (already present, or Pluriverse not reachable from here).');
         }
     }
-    info('quota: ' . ($reg[$label]['quota']) . ' (recorded only; enforcement is a later feature)');
+    info('quota: ' . $quotaStr . ' GB (' . quota_bytes($quotaStr) . ' bytes; app blocks new uploads over quota, Orrery records usage each worker tick)');
     if (empty($opts['password'])) {
         info('operator has NO password (magic-link login); configure SMTP + trigger a login link, or re-provision with --password=.');
     }
@@ -1170,17 +1173,75 @@ function cmd_work(array $opts): void {
     } else {
         out("Worker pass complete: processed=$processed done=$done failed=$failed.");
     }
+
+    // Disk-usage monitor: cheap, runs every worker tick. Records usage per
+    // instance; the instance app self-enforces uploads from TELARIS_QUOTA_BYTES.
+    quota_scan();
+}
+
+/** Quota in GB (or 'infinite'/0/'') -> bytes; 0 means unlimited. */
+function quota_bytes(string $quota): int {
+    $q = strtolower(trim($quota));
+    if ($q === '' || $q === 'infinite' || $q === '0') { return 0; }
+    return (int)round((float)$q * 1073741824); // GiB
+}
+
+/**
+ * Measure each instance's disk tree and record usage in the registry
+ * (disk_used_bytes, over_quota, quota_checked_at). Read-only + best-effort: a
+ * single instance's failure never aborts the scan. `du` runs via `podman
+ * unshare` because the tree is owned by the container's mapped uid (100032),
+ * which the Orrery user cannot stat directly. Enforcement of new uploads lives
+ * in the instance app (TELARIS_QUOTA_BYTES); this is the operator-visibility +
+ * over-quota-flag half.
+ */
+function quota_scan(): void {
+    $reg = registry_load();
+    if (!$reg) { return; }
+    $changed = false;
+    foreach ($reg as $label => $rec) {
+        $dir = instance_dir((string)$label);
+        if (!is_dir($dir)) { continue; }
+        $r = run([PODMAN, 'unshare', 'du', '-sb', '--', $dir]);
+        if ($r['code'] !== 0) {
+            warn("quota: du failed for '$label': " . trim($r['err'] ?: $r['out']));
+            continue;
+        }
+        $used = (int)strtok(trim($r['out']), "\t ");
+        $limit = quota_bytes((string)($rec['quota'] ?? '0'));
+        $over = $limit > 0 && $used > $limit;
+        $reg[$label]['disk_used_bytes'] = $used;
+        $reg[$label]['over_quota'] = $over;
+        $reg[$label]['quota_checked_at'] = gmdate('c');
+        $changed = true;
+        if ($over) {
+            warn(sprintf("quota: '%s' OVER quota (%s used / %s limit)",
+                $label, human_bytes($used), human_bytes($limit)));
+        }
+    }
+    if ($changed) { registry_save($reg); }
+}
+
+/** Bytes -> short human string (for log lines). */
+function human_bytes(int $n): string {
+    $u = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    $i = 0; $v = (float)$n;
+    while ($v >= 1024 && $i < count($u) - 1) { $v /= 1024; $i++; }
+    return ($i === 0 ? (string)$n : sprintf('%.1f', $v)) . $u[$i];
 }
 
 function cmd_list(): void {
     $reg = registry_load();
     if (!$reg) { out('No instances in the registry.'); return; }
-    printf("%-16s %-26s %-7s %-22s %-10s %s\n", 'LABEL', 'HOSTNAME', 'PORT', 'DB', 'STATUS', 'LIVE');
+    printf("%-16s %-26s %-7s %-22s %-10s %-5s %s\n", 'LABEL', 'HOSTNAME', 'PORT', 'DB', 'STATUS', 'LIVE', 'DISK');
     foreach ($reg as $r) {
         $live = isset($r['port']) ? curl_status((int)$r['port']) : '-';
-        printf("%-16s %-26s %-7s %-22s %-10s %s\n",
+        $disk = isset($r['disk_used_bytes'])
+            ? human_bytes((int)$r['disk_used_bytes']) . '/' . ($r['quota'] ?? '?') . 'G' . (!empty($r['over_quota']) ? ' OVER' : '')
+            : '-';
+        printf("%-16s %-26s %-7s %-22s %-10s %-5s %s\n",
             $r['label'] ?? '?', $r['hostname'] ?? '?', (string)($r['port'] ?? '?'),
-            $r['db_name'] ?? '?', $r['status'] ?? '?', $live);
+            $r['db_name'] ?? '?', $r['status'] ?? '?', $live, $disk);
     }
 }
 
@@ -1225,7 +1286,8 @@ function usage(): void {
     out('  telaris-orrery deprovision <label> [--yes]');
     out('  telaris-orrery suspend <label>');
     out('  telaris-orrery resume <label>');
-    out('  telaris-orrery work [--max=N]      drain the Pluriverse provisioning_jobs queue');
+    out('  telaris-orrery work [--max=N]      drain the Pluriverse provisioning_jobs queue (also runs a quota scan)');
+    out('  telaris-orrery quota               measure disk usage per instance, record over-quota flags');
     out('  telaris-orrery list');
     out('  telaris-orrery inspect <label>');
 }
@@ -1255,6 +1317,7 @@ try {
             cmd_resume($pos[0]);
             break;
         case 'work':    cmd_work($opts); break;
+        case 'quota':   quota_scan(); out('Quota scan complete.'); break;
         case 'list':    cmd_list(); break;
         case 'inspect':
             if (!isset($pos[0])) { fail('inspect needs a <label>.'); }
