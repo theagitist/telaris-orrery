@@ -76,6 +76,10 @@ define('NGINX_ORRERY_DIR',cfg('TELARIS_NGINX_ORRERY_DIR','/etc/nginx/telaris-orr
 // the operator's concern, not the Orrery's.
 define('INSTANCE_TLS_CERT', cfg('TELARIS_INSTANCE_TLS_CERT', '/etc/ssl/telaris-instance-origin.crt'));
 define('INSTANCE_TLS_KEY',  cfg('TELARIS_INSTANCE_TLS_KEY',  '/etc/ssl/telaris-instance-origin.key'));
+// Pluriverse checkout, for the one www-data step that encrypts + inserts a
+// federation instances row on CLI provision (the PII master key is www-data
+// only). Empty/unreachable -> CLI provision just skips auto-trust.
+define('PLURIVERSE_APP_DIR', cfg('TELARIS_PLURIVERSE_APP_DIR', '/var/www/www.telaris.ca'));
 define('REGISTRY_FILE',  cfg('TELARIS_ORRERY_REGISTRY', dirname(__DIR__) . '/registry.json'));
 define('MAIL_FROM_NAME', cfg('TELARIS_MAIL_FROM_NAME', 'Telaris'));
 define('PORT_MIN', (int)cfg('TELARIS_PORT_MIN', '18080'));
@@ -590,6 +594,40 @@ function nginx_reload(): void {
 // provision
 // ===========================================================================
 
+/**
+ * 3f auto-trust for CLI provisions: create the PENDING Pluriverse `instances`
+ * row via a one-shot www-data step (only www-data holds the PII master key that
+ * encrypts the operator email), reusing the SAME db_create_pending_federation_
+ * instance() the request/approval flow uses. Returns the new instance id, or 0
+ * if it could not be created (already present / Pluriverse not co-located /
+ * error). The caller then publishes it with worker_publish_instance(). Values
+ * travel as env on an exec-style argv (no shell), so no quoting/injection.
+ * Best-effort: a 0 just means "no auto-trust", the instance still serves.
+ */
+function orrery_register_pending_instance(string $label, string $email, string $locale, string $framing): int {
+    $snippet =
+        '$d=getenv("IL_APPDIR");'
+      . 'require $d."/config.php";'
+      . 'if(!function_exists("getDB")) require $d."/inc/db.php";'
+      . 'require_once $d."/inc/db_federation.php";'
+      . '$id=db_create_pending_federation_instance(getenv("IL_LABEL"),getenv("IL_EMAIL"),getenv("IL_LOCALE"),getenv("IL_FRAMING")?:null);'
+      . 'echo (int)$id;';
+    $r = run([
+        SUDO, '-n', '-u', 'www-data', '/usr/bin/env',
+        'IL_APPDIR='  . PLURIVERSE_APP_DIR,
+        'IL_LABEL='   . $label,
+        'IL_EMAIL='   . $email,
+        'IL_LOCALE='  . $locale,
+        'IL_FRAMING=' . $framing,
+        '/usr/bin/php', '-r', $snippet,
+    ]);
+    if ($r['code'] !== 0) {
+        warn('federation register (www-data) failed: ' . trim($r['err'] ?: $r['out']));
+        return 0;
+    }
+    return (int)trim($r['out']);
+}
+
 /** @param array<string,string|bool> $opts */
 function cmd_provision(string $label, array $opts): void {
     $label = validate_label($label);
@@ -744,7 +782,20 @@ function cmd_provision(string $label, array $opts): void {
     info("URL (local): curl -H 'Host: $hostname' http://127.0.0.1:$port/   (or via the host vhost once DNS resolves)");
     info("federation keyid: $keyid");
     if ($federate) {
-        info('federation: opted IN -- keypair minted; Pluriverse auto-trust wiring is Phase 3 (not yet recorded on the Pluriverse).');
+        // 3f auto-trust: www-data creates the encrypted pending instances row,
+        // then we backfill the minted key + publish it (same two helpers the
+        // request/approval worker uses). Best-effort; never aborts a provision.
+        $iid = orrery_register_pending_instance($label, $email, (string)($opts['locale'] ?? 'en'), (string)($opts['site-tagline'] ?? ''));
+        if ($iid > 0) {
+            try {
+                $pub = worker_publish_instance(pluriverse_pdo(), $iid, $label);
+                info("federation: published to the Pluriverse (instances#$iid" . ($pub ? ", $pub" : '') . ').');
+            } catch (Throwable $e) {
+                warn('federation publish failed (non-fatal): ' . $e->getMessage());
+            }
+        } else {
+            info('federation: opted IN, keypair minted; Pluriverse row not recorded (already present, or Pluriverse not reachable from here).');
+        }
     }
     info('quota: ' . ($reg[$label]['quota']) . ' (recorded only; enforcement is a later feature)');
     if (empty($opts['password'])) {
