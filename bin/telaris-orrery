@@ -820,6 +820,7 @@ function cmd_deprovision(string $label, array $opts): void {
         info("- stop + remove the pod and its Quadlet unit");
         info("- DROP database $dbName + role $dbUser on managed PG");
         info("- remove the instance tree " . instance_dir($label) . " and the nginx route");
+        info("- retract its Pluriverse federation registration (if federated)");
         fwrite(STDOUT, "Type the label to confirm: ");
         $ans = trim((string)fgets(STDIN));
         if ($ans !== $label) { fail('Confirmation did not match; aborted.'); }
@@ -864,6 +865,21 @@ function cmd_deprovision(string $label, array $opts): void {
         unlink(nginx_vhost_path($label));
         nginx_reload();
         info('nginx reloaded');
+    }
+
+    // --- retract the Pluriverse federation row (if any) ---
+    // No PII key needed, so the Orrery does this directly via pluriverse_pdo().
+    // DELETE (not just set 'withdrawn') so a re-provision of the same label does
+    // not hit the UNIQUE(label) constraint; the instance + its keypair are gone
+    // anyway. Best-effort: a failure must not block teardown.
+    // ponytail: catalog removal only; peer-side trust revocation/notification is
+    // a separate stage-6 concern, not done here.
+    try {
+        $st = pluriverse_pdo()->prepare("DELETE FROM instances WHERE label = :l");
+        $st->execute([':l' => $label]);
+        if ($st->rowCount() > 0) { info('federation: retracted Pluriverse instances row'); }
+    } catch (Throwable $e) {
+        warn('federation retract failed (non-fatal): ' . $e->getMessage());
     }
 
     // --- drop DB + role ---
