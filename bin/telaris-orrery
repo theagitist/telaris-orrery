@@ -94,15 +94,14 @@ define('NGINX', '/usr/sbin/nginx');
 define('CURL', '/usr/bin/curl');
 define('TAR', '/usr/bin/tar');
 
-// --- worker (the `work` subcommand drains the Pluriverse provisioning_jobs) ---
-// Connects to the Pluriverse DB as the telaris_pluriverse role (the Orrery user
-// can read its password keyfile; www-data and the Orrery user share only the
-// job table). Defaults mirror the Pluriverse config.php; override via env.
-define('PLURIVERSE_DB_HOST', cfg('TELARIS_PLURIVERSE_DB_HOST', 'private-polivoxia-pg1-do-user-18640906-0.i.db.ondigitalocean.com'));
-define('PLURIVERSE_DB_PORT', cfg('TELARIS_PLURIVERSE_DB_PORT', '25060'));
-define('PLURIVERSE_DB_NAME', cfg('TELARIS_PLURIVERSE_DB_NAME', 'telaris_pluriverse'));
-define('PLURIVERSE_DB_USER', cfg('TELARIS_PLURIVERSE_DB_USER', 'telaris_pluriverse'));
-define('PLURIVERSE_DB_PASS_FILE', cfg('TELARIS_PLURIVERSE_DB_PASS_FILE', getenv('HOME') . '/apps/keys/pluriverse-postgres-dev'));
+// --- Pluriverse bridge (ALL access to Pluriverse-owned tables goes through it) ---
+// The Orrery holds NO database credentials to the Pluriverse and NO PII master
+// key. Every read/write of the federation `instances` registry and the
+// `provisioning_jobs` queue is performed by invoking this committed dispatcher
+// as www-data (see pluriverse_call()). www-data owns that schema and the PII
+// key; the Orrery only names whitelisted functions. This is the entire trust
+// surface the Orrery has into the Pluriverse.
+define('BRIDGE_SCRIPT', PLURIVERSE_APP_DIR . '/bin/pluriverse-bridge.php');
 // Operator-identity handoff key, shared between the Pluriverse web app (seals at
 // approve time, runs as www-data) and this worker (unseals, runs as the Orrery
 // user). A narrow capability: it decrypts only the per-job operator handoff
@@ -596,36 +595,20 @@ function nginx_reload(): void {
 
 /**
  * 3f auto-trust for CLI provisions: create the PENDING Pluriverse `instances`
- * row via a one-shot www-data step (only www-data holds the PII master key that
+ * row through the www-data bridge (only www-data holds the PII master key that
  * encrypts the operator email), reusing the SAME db_create_pending_federation_
  * instance() the request/approval flow uses. Returns the new instance id, or 0
  * if it could not be created (already present / Pluriverse not co-located /
- * error). The caller then publishes it with worker_publish_instance(). Values
- * travel as env on an exec-style argv (no shell), so no quoting/injection.
+ * error). The caller then publishes it with worker_publish_instance().
  * Best-effort: a 0 just means "no auto-trust", the instance still serves.
  */
 function orrery_register_pending_instance(string $label, string $email, string $locale, string $framing): int {
-    $snippet =
-        '$d=getenv("IL_APPDIR");'
-      . 'require $d."/config.php";'
-      . 'if(!function_exists("getDB")) require $d."/inc/db.php";'
-      . 'require_once $d."/inc/db_federation.php";'
-      . '$id=db_create_pending_federation_instance(getenv("IL_LABEL"),getenv("IL_EMAIL"),getenv("IL_LOCALE"),getenv("IL_FRAMING")?:null);'
-      . 'echo (int)$id;';
-    $r = run([
-        SUDO, '-n', '-u', 'www-data', '/usr/bin/env',
-        'IL_APPDIR='  . PLURIVERSE_APP_DIR,
-        'IL_LABEL='   . $label,
-        'IL_EMAIL='   . $email,
-        'IL_LOCALE='  . $locale,
-        'IL_FRAMING=' . $framing,
-        '/usr/bin/php', '-r', $snippet,
-    ]);
-    if ($r['code'] !== 0) {
-        warn('federation register (www-data) failed: ' . trim($r['err'] ?: $r['out']));
+    try {
+        return (int)pluriverse_call('register_pending', [$label, $email, $locale, $framing]);
+    } catch (Throwable $e) {
+        warn('federation register (bridge) failed: ' . $e->getMessage());
         return 0;
     }
-    return (int)trim($r['out']);
 }
 
 /** @param array<string,string|bool> $opts */
@@ -788,7 +771,7 @@ function cmd_provision(string $label, array $opts): void {
         $iid = orrery_register_pending_instance($label, $email, (string)($opts['locale'] ?? 'en'), (string)($opts['site-tagline'] ?? ''));
         if ($iid > 0) {
             try {
-                $pub = worker_publish_instance(pluriverse_pdo(), $iid, $label);
+                $pub = worker_publish_instance($iid, $label);
                 info("federation: published to the Pluriverse (instances#$iid" . ($pub ? ", $pub" : '') . ').');
             } catch (Throwable $e) {
                 warn('federation publish failed (non-fatal): ' . $e->getMessage());
@@ -868,16 +851,15 @@ function cmd_deprovision(string $label, array $opts): void {
     }
 
     // --- retract the Pluriverse federation row (if any) ---
-    // No PII key needed, so the Orrery does this directly via pluriverse_pdo().
-    // DELETE (not just set 'withdrawn') so a re-provision of the same label does
-    // not hit the UNIQUE(label) constraint; the instance + its keypair are gone
-    // anyway. Best-effort: a failure must not block teardown.
+    // Through the bridge (db_retract_instance): DELETE (not just set 'withdrawn')
+    // so a re-provision of the same label does not hit the UNIQUE(label)
+    // constraint; the instance + its keypair are gone anyway. Best-effort: a
+    // failure must not block teardown.
     // ponytail: catalog removal only; peer-side trust revocation/notification is
     // a separate stage-6 concern, not done here.
     try {
-        $st = pluriverse_pdo()->prepare("DELETE FROM instances WHERE label = :l");
-        $st->execute([':l' => $label]);
-        if ($st->rowCount() > 0) { info('federation: retracted Pluriverse instances row'); }
+        $n = (int)pluriverse_call('retract', [$label]);
+        if ($n > 0) { info('federation: retracted Pluriverse instances row'); }
     } catch (Throwable $e) {
         warn('federation retract failed (non-fatal): ' . $e->getMessage());
     }
@@ -938,22 +920,31 @@ function cmd_resume(string $label): void {
 // array, and all SQL is parameterized. See the trust-boundary section of the
 // Self-service instances plan.
 
-/** PDO to the Pluriverse DB as the telaris_pluriverse role (verify-ca). */
-function pluriverse_pdo(): PDO {
-    if (!is_readable(PLURIVERSE_DB_PASS_FILE)) {
-        fail('Pluriverse DB password keyfile not readable: ' . PLURIVERSE_DB_PASS_FILE);
+/**
+ * Call a whitelisted Pluriverse function through the www-data bridge dispatcher.
+ * Arguments go as a JSON array on stdin (no shell quoting / no injection); the
+ * dispatcher echoes {"ok":bool,...}. Returns the decoded `result` on success.
+ * Throws OrreryError on a non-zero exit or an {"ok":false} envelope, so callers
+ * that want best-effort behaviour must catch. This is the Orrery's ONLY path to
+ * the Pluriverse DB; it holds no DB credentials of its own.
+ *
+ * @param array<int,mixed> $args
+ * @return mixed
+ */
+function pluriverse_call(string $func, array $args = []) {
+    $r = run([
+        SUDO, '-n', '-u', 'www-data', '/usr/bin/php', BRIDGE_SCRIPT, $func,
+    ], [], json_encode(array_values($args), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $out = trim($r['out']);
+    $env = json_decode($out, true);
+    if (!is_array($env) || !array_key_exists('ok', $env)) {
+        throw new OrreryError("bridge '$func' returned no JSON envelope (exit {$r['code']}): "
+            . trim($r['err'] ?: $out));
     }
-    $pass = trim((string)file_get_contents(PLURIVERSE_DB_PASS_FILE));
-    $sslmode = is_readable(DB_SSL_CA) ? 'verify-ca' : 'require';
-    $dsn = 'pgsql:host=' . PLURIVERSE_DB_HOST . ';port=' . PLURIVERSE_DB_PORT
-        . ';dbname=' . PLURIVERSE_DB_NAME . ';sslmode=' . $sslmode;
-    if (is_readable(DB_SSL_CA)) {
-        $dsn .= ';sslrootcert=' . DB_SSL_CA;
+    if ($env['ok'] !== true) {
+        throw new OrreryError("bridge '$func' failed: " . (string)($env['error'] ?? 'unknown'));
     }
-    return new PDO($dsn, PLURIVERSE_DB_USER, $pass, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_TIMEOUT => 15,
-    ]);
+    return $env['result'] ?? null;
 }
 
 /** Load the 32-byte operator-handoff key (shared with the Pluriverse app). */
@@ -1008,90 +999,33 @@ function handoff_unseal(string $hex): array {
 }
 
 /**
- * Atomically claim the next due job. Returns the claimed row (status already
+ * Atomically claim the next due job (via the bridge: FOR UPDATE SKIP LOCKED so
+ * concurrent workers never collide). Returns the claimed row (status already
  * flipped to 'running', attempt_count incremented) or null if the queue is
- * empty. Uses FOR UPDATE SKIP LOCKED so concurrent workers never collide.
+ * empty.
  */
-function worker_claim_job(PDO $pdo): ?array {
-    $pdo->beginTransaction();
-    try {
-        $sel = $pdo->query("
-            SELECT id, request_id, job_type, label, payload::text AS payload, attempt_count
-            FROM provisioning_jobs
-            WHERE status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-            ORDER BY id ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-        ");
-        $row = $sel->fetch(PDO::FETCH_ASSOC);
-        if ($row === false) {
-            $pdo->rollBack();
-            return null;
-        }
-        $upd = $pdo->prepare("
-            UPDATE provisioning_jobs
-            SET status = 'running', attempt_count = attempt_count + 1, last_attempt_at = NOW()
-            WHERE id = :id
-        ");
-        $upd->execute([':id' => (int)$row['id']]);
-        $pdo->commit();
-        $row['attempt_count'] = (int)$row['attempt_count'] + 1;
-        return $row;
-    } catch (Throwable $e) {
-        if ($pdo->inTransaction()) $pdo->rollBack();
-        throw $e;
-    }
+function worker_claim_job(): ?array {
+    $row = pluriverse_call('claim_job');
+    return is_array($row) ? $row : null;
 }
 
 /** Mark a claimed job done (terminal success). */
-function worker_finish_job(PDO $pdo, int $jobId, array $result): void {
-    $stmt = $pdo->prepare("
-        UPDATE provisioning_jobs
-        SET status = 'done', last_error = NULL, result = CAST(:r AS JSONB)
-        WHERE id = :id
-    ");
-    $stmt->bindValue(':r', json_encode($result, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-    $stmt->bindValue(':id', $jobId, PDO::PARAM_INT);
-    $stmt->execute();
+function worker_finish_job(int $jobId, array $result): void {
+    pluriverse_call('finish_job', [$jobId, $result]);
 }
 
 /**
  * Record a failed attempt: re-queue with backoff if attempts remain, else
- * give up. Backoff = attempt^2 minutes (1, 4, 9, 16, ...).
+ * give up. Backoff = attempt^2 minutes (1, 4, 9, 16, ...). Returns
+ * 'given_up' or 'requeued'.
  */
-function worker_fail_job(PDO $pdo, int $jobId, int $attemptCount, string $error): string {
-    $error = substr($error, 0, 2048);
-    if ($attemptCount >= WORKER_MAX_ATTEMPTS) {
-        $stmt = $pdo->prepare("
-            UPDATE provisioning_jobs SET status = 'given_up', last_error = :e WHERE id = :id
-        ");
-        $stmt->execute([':e' => $error, ':id' => $jobId]);
-        return 'given_up';
-    }
-    $delayMin = $attemptCount * $attemptCount;
-    $stmt = $pdo->prepare("
-        UPDATE provisioning_jobs
-        SET status = 'queued', last_error = :e, next_attempt_at = NOW() + (:d * INTERVAL '1 minute')
-        WHERE id = :id
-    ");
-    $stmt->bindValue(':e', $error);
-    $stmt->bindValue(':d', $delayMin, PDO::PARAM_INT);
-    $stmt->bindValue(':id', $jobId, PDO::PARAM_INT);
-    $stmt->execute();
-    return 'requeued';
+function worker_fail_job(int $jobId, int $attemptCount, string $error): string {
+    return (string)pluriverse_call('fail_job', [$jobId, $attemptCount, WORKER_MAX_ATTEMPTS, $error]);
 }
 
 /** Set instance_requests.status (+ optional instance_id) for a job's request. */
-function worker_set_request_status(PDO $pdo, ?int $requestId, string $status, ?int $instanceId = null): void {
-    if ($requestId === null) return;
-    $sets = ['status = :s'];
-    $params = [':s' => $status, ':id' => $requestId];
-    if ($instanceId !== null) {
-        $sets[] = 'instance_id = :iid';
-        $params[':iid'] = $instanceId;
-    }
-    $stmt = $pdo->prepare('UPDATE instance_requests SET ' . implode(', ', $sets) . ' WHERE id = :id');
-    $stmt->execute($params);
+function worker_set_request_status(?int $requestId, string $status, ?int $instanceId = null): void {
+    pluriverse_call('set_request_status', [$requestId, $status, $instanceId]);
 }
 
 /**
@@ -1099,14 +1033,17 @@ function worker_set_request_status(PDO $pdo, ?int $requestId, string $status, ?i
  * provisioned instance minted, and publish its (previously PENDING) Pluriverse
  * `instances` row by writing the key and flipping admission_status to
  * 'published'. The Pluriverse pre-created the row at approval (it holds the PII
- * master key the worker lacks) and left public_key empty + status 'pending';
- * this fills the one piece only the running instance can supply.
+ * master key the Orrery lacks) and left public_key empty + status 'pending';
+ * reading the key from inside the container is the one piece only the running
+ * instance can supply, and the only step that genuinely belongs to the Orrery.
+ * The publish itself goes through the bridge (db_publish_instance_key).
  *
- * Returns the keyid on success, or null if the key could not be read or the
- * row was not in 'pending' (e.g. already published on a retry). Non-fatal: the
- * instance is already serving; auto-trust can be reconciled later.
+ * Returns the published hostname on success, or null if the key could not be
+ * read or the row was not in 'pending' (e.g. already published on a retry).
+ * Non-fatal: the instance is already serving; auto-trust can be reconciled
+ * later.
  */
-function worker_publish_instance(PDO $pdo, int $instanceId, string $label): ?string {
+function worker_publish_instance(int $instanceId, string $label): ?string {
     // Raw 32-byte Ed25519 public key, hex-encoded, from inside the container.
     $r = run([PODMAN, 'exec', app_container($label), 'php', '-r',
         'require_once "/var/www/html/config.php"; '
@@ -1117,16 +1054,8 @@ function worker_publish_instance(PDO $pdo, int $instanceId, string $label): ?str
         warn("3f: could not read public key for '$label' (got " . substr($pkHex, 0, 80) . '); leaving instances row pending');
         return null;
     }
-    // Backfill + publish only if still pending (idempotent across retries).
-    $stmt = $pdo->prepare("
-        UPDATE instances
-        SET public_key = decode(:pk, 'hex'), admission_status = 'published', last_seen_at = NOW()
-        WHERE id = :id AND admission_status = 'pending'
-        RETURNING hostname
-    ");
-    $stmt->execute([':pk' => $pkHex, ':id' => $instanceId]);
-    $host = $stmt->fetchColumn();
-    if ($host === false) {
+    $host = pluriverse_call('publish_key', [$instanceId, $pkHex]); // null if not pending
+    if ($host === null) {
         info("3f: instances row #$instanceId for '$label' was not pending (already published?); no change");
         return null;
     }
@@ -1135,7 +1064,7 @@ function worker_publish_instance(PDO $pdo, int $instanceId, string $label): ?str
 }
 
 /** Run one claimed job to completion. Throws on failure (caller records it). */
-function worker_run_job(PDO $pdo, array $job): array {
+function worker_run_job(array $job): array {
     $jobType = (string)$job['job_type'];
     $label = validate_label((string)$job['label']); // re-validate charset / reserved
     $requestId = $job['request_id'] !== null ? (int)$job['request_id'] : null;
@@ -1168,7 +1097,7 @@ function worker_run_job(PDO $pdo, array $job): array {
             if (!empty($payload['quota']))        { $opts['quota']          = (string)$payload['quota']; }
             if (!$federate)                       { $opts['no-federate']    = true; }
 
-            worker_set_request_status($pdo, $requestId, 'provisioning');
+            worker_set_request_status($requestId, 'provisioning');
             cmd_provision($label, $opts);
 
             // Read back the recorded keyid for the job result.
@@ -1183,13 +1112,13 @@ function worker_run_job(PDO $pdo, array $job): array {
             $instanceId = isset($payload['instance_id']) ? (int)$payload['instance_id'] : 0;
             if ($federate && $instanceId > 0) {
                 try {
-                    $published = worker_publish_instance($pdo, $instanceId, $label);
+                    $published = worker_publish_instance($instanceId, $label);
                 } catch (Throwable $e) {
                     warn('3f publish failed (non-fatal): ' . $e->getMessage());
                 }
             }
 
-            worker_set_request_status($pdo, $requestId, 'provisioned');
+            worker_set_request_status($requestId, 'provisioned');
             return ['action' => 'provision', 'label' => $label, 'keyid' => $keyid, 'published' => $published];
 
         case 'deprovision':
@@ -1211,26 +1140,25 @@ function worker_run_job(PDO $pdo, array $job): array {
 
 function cmd_work(array $opts): void {
     $max = isset($opts['max']) ? max(1, (int)$opts['max']) : WORKER_MAX_JOBS;
-    $pdo = pluriverse_pdo();
     $done = 0; $failed = 0; $processed = 0;
 
     for ($i = 0; $i < $max; $i++) {
-        $job = worker_claim_job($pdo);
+        $job = worker_claim_job();
         if ($job === null) break; // queue drained
         $processed++;
         $jobId = (int)$job['id'];
         $requestId = $job['request_id'] !== null ? (int)$job['request_id'] : null;
         step("job#$jobId {$job['job_type']} '{$job['label']}' (attempt {$job['attempt_count']})");
         try {
-            $result = worker_run_job($pdo, $job);
-            worker_finish_job($pdo, $jobId, $result);
+            $result = worker_run_job($job);
+            worker_finish_job($jobId, $result);
             $done++;
             info("job#$jobId done");
         } catch (Throwable $e) {
-            $outcome = worker_fail_job($pdo, $jobId, (int)$job['attempt_count'], $e->getMessage());
+            $outcome = worker_fail_job($jobId, (int)$job['attempt_count'], $e->getMessage());
             // On terminal give-up of a provision, surface the request as failed.
             if ($outcome === 'given_up' && $job['job_type'] === 'provision') {
-                worker_set_request_status($pdo, $requestId, 'failed');
+                worker_set_request_status($requestId, 'failed');
             }
             $failed++;
             warn("job#$jobId $outcome: " . $e->getMessage());
