@@ -82,6 +82,16 @@ define('INSTANCE_TLS_KEY',  cfg('TELARIS_INSTANCE_TLS_KEY',  '/etc/ssl/telaris-i
 define('PLURIVERSE_APP_DIR', cfg('TELARIS_PLURIVERSE_APP_DIR', '/var/www/www.telaris.ca'));
 define('REGISTRY_FILE',  cfg('TELARIS_ORRERY_REGISTRY', dirname(__DIR__) . '/registry.json'));
 define('MAIL_FROM_NAME', cfg('TELARIS_MAIL_FROM_NAME', 'Telaris'));
+// SMTP relay injected into every provisioned instance so it can send mail out of
+// the box (config-driven; ZeptoMail by default). The token is read at provision
+// time from MAIL_PASS_FILE (a ZeptoMail "Password 1: <token>" descriptor or a
+// plain token file); if it is unreadable the instance is born mail-less.
+define('MAIL_FROM_ADDRESS', cfg('TELARIS_MAIL_FROM_ADDRESS', 'no-reply@telaris.ca'));
+define('MAIL_SMTP_HOST',    cfg('TELARIS_MAIL_HOST',   'smtp.zeptomail.com'));
+define('MAIL_SMTP_PORT',    cfg('TELARIS_MAIL_PORT',   '587'));
+define('MAIL_SMTP_USER',    cfg('TELARIS_MAIL_USER',   'emailapikey'));
+define('MAIL_SMTP_SECURE',  cfg('TELARIS_MAIL_SECURE', 'tls'));
+define('MAIL_PASS_FILE',    cfg('TELARIS_MAIL_PASS_FILE', getenv('HOME') . '/apps/keys/zeptomail'));
 define('PORT_MIN', (int)cfg('TELARIS_PORT_MIN', '18080'));
 define('PORT_MAX', (int)cfg('TELARIS_PORT_MAX', '18999'));
 define('DEFAULT_QUOTA_GB', cfg('TELARIS_DEFAULT_QUOTA_GB', '5'));
@@ -611,6 +621,43 @@ function orrery_register_pending_instance(string $label, string $email, string $
     }
 }
 
+/**
+ * SMTP env for a provisioned instance, read from the mail keyfile at provision
+ * time. Returns the MAIL_* pairs render-config.sh maps into the in-container
+ * config.php, or [] if the token cannot be read (instance is then born
+ * mail-less, which is a warning, not a failure). Accepts either a ZeptoMail
+ * descriptor (a "Password 1: <token>" line) or a plain one-line token file.
+ *
+ * @return array<string,string>
+ */
+function mail_env(): array {
+    if (!is_readable(MAIL_PASS_FILE)) {
+        warn('mail: ' . MAIL_PASS_FILE . ' not readable; instance provisioned without SMTP');
+        return [];
+    }
+    $raw = (string)file_get_contents(MAIL_PASS_FILE);
+    $token = '';
+    foreach (preg_split('/\r?\n/', $raw) as $line) {
+        if (stripos($line, 'Password 1:') === 0) {
+            $token = trim(substr($line, strlen('Password 1:')));
+            break;
+        }
+    }
+    if ($token === '') { $token = trim($raw); } // plain token file
+    if ($token === '') {
+        warn('mail: no token parsed from ' . MAIL_PASS_FILE . '; instance provisioned without SMTP');
+        return [];
+    }
+    return [
+        'MAIL_SMTP_HOST'    => MAIL_SMTP_HOST,
+        'MAIL_SMTP_PORT'    => MAIL_SMTP_PORT,
+        'MAIL_SMTP_USER'    => MAIL_SMTP_USER,
+        'MAIL_SMTP_PASS'    => $token,
+        'MAIL_SMTP_SECURE'  => MAIL_SMTP_SECURE,
+        'MAIL_FROM_ADDRESS' => MAIL_FROM_ADDRESS,
+    ];
+}
+
 /** @param array<string,string|bool> $opts */
 function cmd_provision(string $label, array $opts): void {
     $label = validate_label($label);
@@ -670,6 +717,9 @@ function cmd_provision(string $label, array $opts): void {
         // Disk quota the instance app self-enforces at upload time (0 = unlimited).
         'TELARIS_QUOTA_BYTES' => (string)quota_bytes($quotaStr),
     ];
+    // Inject the SMTP relay (ZeptoMail by default) so the instance can send mail
+    // immediately; no-op (warns) if the token keyfile is unreadable.
+    $envPairs = array_merge($envPairs, mail_env());
     $yamlPath = instance_dir($label) . '/conf/' . $label . '.kube.yaml';
     file_put_contents($yamlPath, render_kube_yaml($label, $port, $envPairs));
     chmod($yamlPath, 0600);
