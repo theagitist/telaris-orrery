@@ -37,7 +37,7 @@ into the container instead of using the in-image copy).
 3. create the `telaris_<label>` DB + owning role + `unaccent` on the managed cluster
 4. write the per-instance DB password keyfile under `~/apps/keys/`
 5. lay out the bind-mount tree under `${TELARIS_INSTANCES_ROOT}/<label>/`
-6. render the `.kube` YAML (host-owned `conf/`) + the Quadlet unit, daemon-reload, start
+6. render the `.kube` YAML (host-owned `conf/`) + the Quadlet unit (`Restart=on-failure`, 10s delay, to survive boot-time start races), daemon-reload, start
 7. seed schema + operator programmatically (`bin/provision-init` inside the container)
 8. write the host nginx route + reload, record the federation keyid, write the registry
 9. unless `--no-federate`: register + publish the instance in the Pluriverse
