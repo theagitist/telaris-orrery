@@ -514,6 +514,10 @@ Wants=network-online.target
 [Kube]
 Yaml=$yamlPath
 
+[Service]
+Restart=on-failure
+RestartSec=10
+
 [Install]
 WantedBy=default.target
 
